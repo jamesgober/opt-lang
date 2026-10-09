@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "opt-lang"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "SSA optimization passes for ir-lang: constant propagation, value numbering, dead code, inlining, and loop optimizations."
+description = "SSA optimization passes for ir-lang: sparse conditional constant propagation, value numbering, dead-code elimination, CFG simplification, copy propagation, and loop-invariant code motion."
 
 # Keywords (5 max)
 keywords = ["optimizer", "ssa", "compiler", "ir", "lexersketch"]
@@ -45,18 +45,24 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = []
+std = ["ir-lang/std", "pass-lang/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# First-party -lang dependencies are wired at v0.2.0, when first used.
+# The IR this crate rewrites. Pinned exactly: 2.0.0-alpha.1 is a pre-release.
+ir-lang   = { version = "=2.0.0-alpha.1", default-features = false }
+# The pipeline scheduler (fixpoint loop and per-pass report).
+pass-lang = { version = "1", default-features = false }
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+# The reference interpreter is the oracle for the differential tests and for the
+# constant folder (`eval_*`).
+ir-lang   = { version = "=2.0.0-alpha.1", features = ["interp"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 
