@@ -6,7 +6,8 @@
 //! carry them in header parameters. They mix everything the optimizer must
 //! respect: constants (so there is something to fold), redundant and
 //! loop-invariant expressions, dead code, branches on constants, `switch`,
-//! loops, checked arithmetic with `error`, `wrap`, and `trap` policies, float
+//! loops, checked arithmetic with `error`, `wrap`, and `trap` policies (OPS v2
+//! `pow` and `saturate` shifts included), float
 //! conversions (NaN included), stack and global memory, volatile accesses,
 //! atomics, bulk memory, direct and indirect calls, `invoke` with landing pads,
 //! `resume`, traps, and calls to imports whose effects are recorded in order.
@@ -121,20 +122,18 @@ impl Ctx<'_, '_> {
     }
 
     /// Emits `data` as a plain instruction, or as a `check` whose error edge
-    /// returns the code + 1000.
+    /// returns the code + 1000, as ir-lang's placement rule (`can_error`)
+    /// requires.
     fn op(&mut self, data: InstData) -> Value {
+        let func = self.b.func();
         let can_error = match &data {
-            InstData::Unary { policy, .. }
-            | InstData::Binary { policy, .. }
-            | InstData::Convert { policy, .. } => policy.can_error(),
-            _ => false,
-        } || matches!(
-            data,
-            InstData::Convert {
-                op: ConvOp::CharFromU32,
-                ..
+            InstData::Unary { op, policy, .. } => op.can_error(*policy),
+            InstData::Binary { op, policy, args } => {
+                op.can_error(*policy, func.value_type(args[0]).unwrap())
             }
-        );
+            InstData::Convert { op, policy, .. } => op.can_error(*policy),
+            _ => false,
+        };
         if !can_error {
             let inst = self.b.insert(data).unwrap();
             return self.b.results(inst).first().unwrap();
@@ -243,16 +242,29 @@ impl Ctx<'_, '_> {
             BinaryOp::Shr,
             BinaryOp::Min,
             BinaryOp::Max,
+            BinaryOp::Pow,
+            BinaryOp::Pow,
         ]);
+        // A `pow` mostly gets a small constant exponent (negative included), so
+        // the partial folds and the `check` rewrites are exercised.
+        let b = if op == BinaryOp::Pow && self.rng.chance(70) {
+            let e = self.rng.pick(&[-1, 0, 1, 2, 2, 3, 5, 63]);
+            self.i64c(e)
+        } else {
+            b
+        };
         let ov = self.overflow();
         let dz = self.rng.pick(&[DivZero::Error, DivZero::Trap]);
         let policy = match op {
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => Policy::overflow(ov),
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Pow => Policy::overflow(ov),
             BinaryOp::Div | BinaryOp::FloorDiv => Policy::overflow(ov).with_div_zero(dz),
             BinaryOp::Rem | BinaryOp::FloorMod => Policy::div_zero(dz),
-            BinaryOp::Shl | BinaryOp::Shr => {
-                Policy::shift(self.rng.pick(&[Shift::Mask, Shift::Mask, Shift::Error]))
-            }
+            BinaryOp::Shl | BinaryOp::Shr => Policy::shift(self.rng.pick(&[
+                Shift::Mask,
+                Shift::Mask,
+                Shift::Error,
+                Shift::Saturate,
+            ])),
             _ => Policy::NONE,
         };
         self.op(InstData::Binary {
@@ -311,6 +323,7 @@ impl Ctx<'_, '_> {
                     BinaryOp::IeeeRem,
                     BinaryOp::Min,
                     BinaryOp::Max,
+                    BinaryOp::Pow,
                 ]);
                 self.b.binary(op, Policy::NONE, fa, fb).unwrap()
             }

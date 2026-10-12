@@ -497,9 +497,10 @@ b3:
 }
 
 #[test]
-fn test_dce_rebuilds_blocks_when_many_parameters_die() {
-    // 24 dead parameters across 6 blocks: more than the in-place limit, so the
-    // blocks are rebuilt (edges retargeted, a self loop included).
+fn test_dce_removes_many_dead_parameters_at_once() {
+    // 24 dead parameters across 6 blocks, removed in one linear
+    // `remove_block_params` call (edges, a self loop included, lose their
+    // arguments).
     let mut text = String::from(
         "module \"t\" ptr64\nsig s0 = (i64) -> (i64) fast\n\nfunc @f s0 export {\nb0(v0: i64):\n    jump b1(v0, v0, v0, v0, v0)\n",
     );
@@ -904,9 +905,9 @@ b2:
 }
 
 #[test]
-fn test_dce_rebuilds_a_landing_pad() {
-    // A landing pad with 20 dead parameters besides the payload: the rebuilt
-    // pad is still reached only by the unwind edge.
+fn test_dce_trims_a_landing_pad() {
+    // A landing pad with 20 dead parameters besides the payload: the pad keeps
+    // its handle and is still reached only by the unwind edge.
     let dead: Vec<String> = (3..23).map(|k| format!("v{k}: i64")).collect();
     let args = vec!["v0"; 20].join(", ");
     let text = format!(
@@ -916,4 +917,277 @@ fn test_dce_rebuilds_a_landing_pad() {
     let (_, s) = run(&text, &[PassKind::Dce]);
     assert!(s.contains("unwind b2(exn)") || s.contains("(exn)"), "{s}");
     assert_eq!(s.matches(": i64,").count(), 0, "{s}");
+}
+
+// ------------------------------------------------------------- OPS v2 pow
+
+#[test]
+fn test_sccp_pow_identities_on_a_signed_check() {
+    // Signed `pow` is always a `check` (its exponent could be negative). With a
+    // constant exponent: `x ** 0` is 1, `x ** 1` is x, `x ** 2` is `x * x`
+    // (plain under `wrap`), and `x ** 3` under `trap` keeps its `check` (it can
+    // still trap) with the dead error edge sent to `unreachable`, so the error
+    // handler goes away.
+    let text = r#"module "t" ptr64
+sig s0 = (i64) -> (i64) fast
+
+func @f s0 export {
+b0(v0: i64):
+    v1: i64 = const 0
+    v2: i64 = const 1
+    v3: i64 = const 2
+    v4: i64 = const 3
+    check pow<overflow=wrap> v0, v1 to b1(res0) error b9(err)
+b1(v5: i64):
+    check pow<overflow=trap> v0, v2 to b2(res0) error b9(err)
+b2(v6: i64):
+    check pow<overflow=wrap> v0, v3 to b3(res0) error b9(err)
+b3(v7: i64):
+    check pow<overflow=trap> v0, v4 to b4(res0) error b9(err)
+b4(v8: i64):
+    v9: i64 = add<overflow=wrap> v5, v6
+    v10: i64 = add<overflow=wrap> v9, v7
+    v11: i64 = add<overflow=wrap> v10, v8
+    ret v11
+b9(v12: u32):
+    v13: i64 = zext v12
+    ret v13
+}
+"#;
+    let s = same_behaviour(
+        text,
+        &[PassKind::Sccp, PassKind::Dce, PassKind::SimplifyCfg],
+        &[
+            &[i64s(3)],
+            &[i64s(-7)],
+            &[i64s(0)],
+            &[i64s(3_000_000)],
+            &[i64s(i64::MIN)],
+        ],
+    );
+    assert_eq!(s.matches("check").count(), 1, "{s}");
+    assert!(s.contains("check pow<overflow=trap> v0, "), "{s}");
+    assert!(s.contains("mul<overflow=wrap> v0, v0"), "{s}");
+    assert!(s.contains("unreachable"), "{s}");
+    assert!(
+        !s.contains("zext"),
+        "the error handler is still there:\n{s}"
+    );
+    // Idempotent: the stub is recognised and reused.
+    let (m, _) = run(&s, &[PassKind::Sccp]);
+    assert_eq!(m.to_string(), s);
+}
+
+#[test]
+fn test_sccp_negative_exponent_takes_the_error_edge_under_every_policy() {
+    // OPS section 6, E0006 (ISSUES P36): `NegativeExponent` even under `trap`.
+    for policy in ["wrap", "trap", "error"] {
+        let text = format!(
+            r#"module "t" ptr64
+sig s0 = (i64) -> (i64) fast
+
+func @f s0 export {{
+b0(v0: i64):
+    v1: i64 = const -1
+    check pow<overflow={policy}> v0, v1 to b1(res0) error b2(err)
+b1(v2: i64):
+    ret v2
+b2(v3: u32):
+    v4: i64 = zext v3
+    ret v4
+}}
+"#
+        );
+        let s = same_behaviour(
+            &text,
+            &[PassKind::Sccp, PassKind::SimplifyCfg],
+            &[&[i64s(5)]],
+        );
+        assert!(!s.contains("check"), "{policy}: {s}");
+        assert!(s.contains("const 6"), "{policy}: {s}");
+        let (m, _) = run(&text, &[PassKind::Sccp]);
+        assert_eq!(call(&m, &[i64s(2)]), Outcome::Return(vec![Val::i64(6)]));
+    }
+}
+
+#[test]
+fn test_sccp_never_drops_an_error_edge_that_can_fire() {
+    // `x ** 3` under `error` can overflow; `x ** y` can get a negative `y`;
+    // `1 ** y` is 1 when it succeeds, but `y` can be negative.
+    let text = r#"module "t" ptr64
+sig s0 = (i64, i64) -> (i64) fast
+
+func @f s0 export {
+b0(v0: i64, v1: i64):
+    v2: i64 = const 3
+    check pow<overflow=error> v0, v2 to b1(res0) error b9(err)
+b1(v3: i64):
+    check pow<overflow=wrap> v0, v1 to b2(res0) error b9(err)
+b2(v4: i64):
+    v5: i64 = const 1
+    check pow<overflow=trap> v5, v1 to b3(res0) error b9(err)
+b3(v6: i64):
+    v7: i64 = add<overflow=wrap> v3, v4
+    v8: i64 = add<overflow=wrap> v7, v6
+    ret v8
+b9(v9: u32):
+    v10: i64 = zext v9
+    ret v10
+}
+"#;
+    let s = same_behaviour(
+        text,
+        &[PassKind::Sccp, PassKind::Dce, PassKind::SimplifyCfg],
+        &[
+            &[i64s(2), i64s(3)],
+            &[i64s(3_000_000), i64s(2)],
+            &[i64s(2), i64s(-1)],
+            &[i64s(-3), i64s(0)],
+        ],
+    );
+    assert_eq!(s.matches("check pow").count(), 3, "{s}");
+    assert!(!s.contains("unreachable"), "{s}");
+    assert!(s.contains("zext"), "{s}");
+}
+
+#[test]
+fn test_sccp_squares_under_error_stay_checked() {
+    // `x ** 2` under `error` becomes `check mul<overflow=error> x, x`: the same
+    // overflow, and no negative exponent left to raise.
+    let text = r#"module "t" ptr64
+sig s0 = (i32) -> (i32) fast
+
+func @f s0 export {
+b0(v0: i32):
+    v1: i32 = const 2
+    check pow<overflow=error> v0, v1 to b1(res0) error b2(err)
+b1(v2: i32):
+    ret v2
+b2(v3: u32):
+    v4: i32 = bitcast v3
+    ret v4
+}
+"#;
+    let inputs: [&[Val]; 3] = [&[Val::i32(5)], &[Val::i32(46_341)], &[Val::i32(-46_340)]];
+    let s = same_behaviour(text, &[PassKind::Sccp], &inputs);
+    assert!(s.contains("check mul<overflow=error> v0, v0"), "{s}");
+    assert!(!s.contains("pow"), "{s}");
+}
+
+#[test]
+fn test_sccp_relaxes_saturating_shifts_by_known_amounts() {
+    // Signed `saturate` shifts are `check`s (a negative amount raises). With a
+    // known amount: in range they are `mask` shifts; past the width `shl` is
+    // 0 and `shr` is the sign fill, `shr<shift=mask>` by width - 1.
+    let text = r#"module "t" ptr64
+sig s0 = (i64) -> (i64) fast
+
+func @f s0 export {
+b0(v0: i64):
+    v1: i64 = const 5
+    v2: i64 = const 70
+    check shl<shift=saturate> v0, v1 to b1(res0) error b9(err)
+b1(v3: i64):
+    check shr<shift=saturate> v0, v2 to b2(res0) error b9(err)
+b2(v4: i64):
+    check shl<shift=saturate> v0, v2 to b3(res0) error b9(err)
+b3(v5: i64):
+    v6: i64 = xor v3, v4
+    v7: i64 = xor v6, v5
+    ret v7
+b9(v8: u32):
+    trap 99
+}
+"#;
+    let s = same_behaviour(
+        text,
+        &[PassKind::Sccp, PassKind::Dce, PassKind::SimplifyCfg],
+        &[
+            &[i64s(12345)],
+            &[i64s(-12345)],
+            &[i64s(0)],
+            &[i64s(i64::MIN)],
+        ],
+    );
+    assert!(!s.contains("check"), "{s}");
+    assert!(s.contains("shl<shift=mask> v0"), "{s}");
+    assert!(s.contains("shr<shift=mask> v0"), "{s}");
+    assert!(s.contains("const 63"), "{s}");
+    assert!(!s.contains("trap 99"), "{s}");
+}
+
+#[test]
+fn test_sccp_folds_unsigned_pow_and_saturate_instructions() {
+    // Unsigned `pow` and `saturate` shifts are plain instructions.
+    let text = r#"module "t" ptr64
+sig s0 = (u64) -> (u64) fast
+
+func @f s0 export {
+b0(v0: u64):
+    v1: u64 = const 0
+    v2: u64 = const 2
+    v3: u64 = const 1
+    v4: u64 = const 64
+    v5: u64 = pow<overflow=wrap> v0, v1
+    v6: u64 = pow<overflow=trap> v0, v2
+    v7: u64 = pow<overflow=trap> v3, v0
+    v8: u64 = pow<overflow=wrap> v0, v3
+    v9: u64 = shl<shift=saturate> v0, v4
+    v10: u64 = shr<shift=saturate> v0, v4
+    v11: u64 = add<overflow=wrap> v5, v6
+    v12: u64 = add<overflow=wrap> v11, v7
+    v13: u64 = add<overflow=wrap> v12, v8
+    v14: u64 = add<overflow=wrap> v13, v9
+    v15: u64 = add<overflow=wrap> v14, v10
+    ret v15
+}
+"#;
+    let s = same_behaviour(
+        text,
+        &[PassKind::Sccp, PassKind::Dce],
+        &[&[Val::u64(3)], &[Val::u64(0)], &[Val::u64(1 << 33)]],
+    );
+    assert!(!s.contains("pow"), "{s}");
+    assert!(!s.contains("saturate"), "{s}");
+    assert!(s.contains("mul<overflow=trap> v0, v0"), "{s}");
+}
+
+#[test]
+fn test_sccp_folds_float_pow_with_the_shared_routine() {
+    let text = r#"module "t" ptr64
+sig s0 = (f64) -> (f64) fast
+
+func @f s0 export {
+b0(v0: f64):
+    v1: f64 = const 2.0
+    v2: f64 = const 10.0
+    v3: f64 = pow v1, v2
+    v4: f64 = const -8.0
+    v5: f64 = const 0.5
+    v6: f64 = pow v4, v5
+    v7: f64 = add v3, v6
+    v8: f64 = add v7, v0
+    ret v8
+}
+"#;
+    let s = same_behaviour(text, &[PassKind::Sccp, PassKind::Dce], &[&[Val::f64(1.0)]]);
+    assert!(s.contains("const 1024.0"), "{s}");
+    // `(-8) ** 0.5` is a NaN: its payload is left to the target, not folded.
+    assert_eq!(s.matches("pow").count(), 1, "{s}");
+}
+
+#[test]
+fn test_gvn_applies_pow_one() {
+    let text = r#"module "t" ptr64
+sig s0 = (u32) -> (u32) fast
+
+func @f s0 export {
+b0(v0: u32):
+    v1: u32 = const 1
+    v2: u32 = pow<overflow=trap> v0, v1
+    ret v2
+}
+"#;
+    let s = same_behaviour(text, &[PassKind::Gvn], &[&[Val::u32(7)]]);
+    assert!(s.contains("ret v0"), "{s}");
 }

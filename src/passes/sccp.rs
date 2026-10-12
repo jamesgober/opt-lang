@@ -11,12 +11,29 @@
 //!   failure goes to the error edge with its OPS code, and a `trap` failure
 //!   becomes a `trap` terminator. An operation that would raise is never folded
 //!   into a value.
-//! - a `check` whose operation provably cannot fail (adding or subtracting a
+//! - a `check` with only some operands constant is folded as far as OPS allows
+//!   (`fold::binary_partial`): `x ** 0` is `1`, `x ** 1` and `x + 0` are `x`,
+//!   a negative constant exponent always raises `NegativeExponent`, a division
+//!   by a constant zero always raises or traps. The normal edge then receives
+//!   the constant or the operand, or control goes straight to the error edge.
+//! - a `check` whose operation provably cannot raise (adding or subtracting a
 //!   constant zero, multiplying by a constant zero or one, a shift by a
-//!   constant in range, a division by a constant other than `0` and `-1`, a
-//!   widening `int_cast`) becomes the plain operation and a jump.
-//! - a `check`'s error code is known on its error edge when the policy allows
-//!   only one error kind.
+//!   constant in range or a non-negative constant under `saturate`, a division
+//!   by a constant other than `0` and `-1`, a widening `int_cast`, a `pow` with
+//!   a constant non-negative exponent under `wrap` or `trap`) becomes the plain
+//!   operation and a jump, **but only when ir-lang's `can_error` accepts the
+//!   plain form**. A signed `pow` is always fallible by that rule (its exponent
+//!   could be negative), so it stays a `check`: `x ** 2` becomes `x * x` under
+//!   the same overflow policy (a plain `mul` under `wrap`/`trap`, a
+//!   `check mul` under `error`), and any other exponent keeps the `check` with
+//!   its dead error edge redirected to an `unreachable` block, so the error
+//!   handler can be deleted. An error edge that can fire is never touched.
+//! - a `check`'s error code is known on its error edge when only one error
+//!   kind remains possible.
+//!
+//! Plain integer operations get the same partial folding: `x ** 0`, `x * 0`,
+//! and `shl<saturate>` by at least the width become constants, `x ** 1` and
+//! `x + 0` become `x`, and `x ** 2` becomes `x * x`.
 //!
 //! Values of type `ptr` and `ref`, and values derived from a `ref`, are never
 //! made constant (addresses are not compile-time values, and a constant `ref`
@@ -32,13 +49,15 @@ use alloc::vec::Vec;
 
 use ir_lang::{
     BinaryOp, Block, BlockArg, BlockCall, BuildError, Builder, ConvOp, DivZero, Function, Inst,
-    InstData, Overflow, Position, Shift, Terminator, Type, Value, ValueDef,
+    InstData, Overflow, Policy, Position, Shift, Terminator, Type, Value, ValueDef,
 };
 
 use crate::Budget;
-use crate::analysis::{Cfg, edge, is_tracked, tracked_values};
-use crate::edit::{block_start, constant, own_operands, replace_terminator, use_counts};
-use crate::fold::{self, Fold};
+use crate::analysis::{Cfg, edge, is_tracked, is_unwind_edge, tracked_values};
+use crate::edit::{
+    block_start, constant, own_operands, replace_terminator, rewrite_terminator, use_counts,
+};
+use crate::fold::{self, Fold, Partial};
 
 const TOP: u8 = 0;
 const CONST: u8 = 1;
@@ -394,19 +413,20 @@ impl<'f> Sccp<'f> {
                 c => c,
             },
             InstData::Binary { op, policy, args } => {
-                match (self.cell(args[0]), self.cell(args[1])) {
-                    (
-                        Cell {
-                            state: CONST,
-                            bits: a,
-                        },
-                        Cell {
-                            state: CONST,
-                            bits: b,
-                        },
-                    ) => fold_cell(fold::binary(*op, *policy, ty(args[0]), a, b)),
-                    (x, y) if x.state == BOTTOM || y.state == BOTTOM => BOTTOM_CELL,
-                    _ => TOP_CELL,
+                let (x, y) = (self.cell(args[0]), self.cell(args[1]));
+                if x.state == CONST && y.state == CONST {
+                    fold_cell(fold::binary(*op, *policy, ty(args[0]), x.bits, y.bits))
+                } else if x.state == BOTTOM && y.state == BOTTOM {
+                    BOTTOM_CELL
+                } else if x.state == BOTTOM || y.state == BOTTOM {
+                    // One operand is known: the OPS identities.
+                    match self.partial(*op, *policy, args) {
+                        Partial::Always(Fold::Value(bits)) => konst(bits),
+                        Partial::Operand(k) => self.cell(args[k]),
+                        _ => BOTTOM_CELL,
+                    }
+                } else {
+                    TOP_CELL
                 }
             }
             InstData::Compare { op, args } => match (self.cell(args[0]), self.cell(args[1])) {
@@ -448,99 +468,111 @@ impl<'f> Sccp<'f> {
         }
     }
 
-    /// The `check` result, error-code cell, and feasible edges (normal, error).
-    fn eval_check(&self, op: &InstData) -> (Cell, Cell, bool, bool) {
-        let mut any_top = false;
-        let mut all_const = true;
-        let mut bits: [u64; 2] = [0; 2];
-        let mut n = 0;
-        op.for_each_operand(|v| {
-            let c = self.cell(v);
-            if c.state == TOP {
-                any_top = true;
-            }
-            if c.state != CONST {
-                all_const = false;
-            }
-            if let Some(slot) = bits.get_mut(n) {
-                *slot = c.bits;
-            }
-            n += 1;
-        });
-        let kinds = fold::error_kinds(op);
-        let single_err = if kinds.count_ones() == 1 {
-            konst(u64::from(kinds.trailing_zeros()))
-        } else {
-            BOTTOM_CELL
-        };
-        if any_top {
-            return (TOP_CELL, TOP_CELL, false, false);
-        }
-        if all_const {
-            match fold_check(self.func, op, bits) {
-                Fold::Value(v) => return (konst(v), TOP_CELL, true, false),
-                Fold::Error(e) => return (TOP_CELL, konst(u64::from(e.code())), false, true),
-                Fold::Trap(_) => return (TOP_CELL, TOP_CELL, false, false),
-                Fold::Unknown => {}
-            }
-        }
-        if !self.may_fail(op) {
-            return (BOTTOM_CELL, TOP_CELL, true, false);
-        }
-        (BOTTOM_CELL, single_err, true, true)
+    /// The type of `v` (`ptr` for an unknown value, which is never folded).
+    fn ty(&self, v: Value) -> Type {
+        self.func.value_type(v).unwrap_or(Type::Ptr)
     }
 
-    /// Whether a `check`'s operation can take its error edge, given what is
-    /// known about its operands (the partial analysis in the module docs).
-    fn may_fail(&self, op: &InstData) -> bool {
-        let func = self.func;
-        match op {
-            InstData::Binary { op, policy, args } => {
-                let ty = func.value_type(args[0]).unwrap_or(Type::Ptr);
-                if !ty.is_int() {
-                    return true;
-                }
-                let lhs = self.cell(args[0]);
-                let known = |c: Cell, v: i128| c.state == CONST && fold::sval(ty, c.bits) == v;
-                // Adding zero, or multiplying by zero or one, cannot overflow.
-                match op {
-                    BinaryOp::Add if known(lhs, 0) => return false,
-                    BinaryOp::Mul if known(lhs, 0) || known(lhs, 1) => return false,
-                    _ => {}
-                }
-                let rhs = self.cell(args[1]);
-                if rhs.state != CONST {
-                    return true;
-                }
-                let y = fold::sval(ty, rhs.bits);
-                let w = i128::from(ty.int_bits().unwrap_or(64));
-                match op {
-                    BinaryOp::Add | BinaryOp::Sub => y != 0,
-                    BinaryOp::Mul => y != 0 && y != 1,
-                    BinaryOp::Shl | BinaryOp::Shr => !(0..w).contains(&y),
-                    BinaryOp::Div | BinaryOp::FloorDiv => {
-                        let overflow_possible = policy.overflow == Some(Overflow::Error)
-                            && ty.is_signed_int()
-                            && y == -1;
-                        let zero_possible = policy.div_zero == Some(DivZero::Error) && y == 0;
-                        overflow_possible || zero_possible
-                    }
-                    BinaryOp::Rem | BinaryOp::FloorMod => {
-                        policy.div_zero == Some(DivZero::Error) && y == 0
-                    }
-                    _ => true,
+    /// The constant bits of `v`, if the analysis found it constant.
+    fn known(&self, v: Value) -> Option<u64> {
+        let c = self.cell(v);
+        (c.state == CONST).then_some(c.bits)
+    }
+
+    /// A binary operation folded as far as its constant operands allow.
+    fn partial(&self, op: BinaryOp, policy: Policy, args: &[Value; 2]) -> Partial {
+        fold::binary_partial(
+            op,
+            policy,
+            self.ty(args[0]),
+            self.known(args[0]),
+            self.known(args[1]),
+        )
+    }
+
+    /// What is known about a `check`'s operation; `None` while an operand is
+    /// still unknown (the optimistic top of the lattice).
+    fn check_partial(&self, data: &InstData) -> Option<Partial> {
+        let mut any_top = false;
+        data.for_each_operand(|v| any_top |= self.cell(v).state == TOP);
+        if any_top {
+            return None;
+        }
+        let open = |errors| Partial::Open {
+            value: None,
+            errors,
+        };
+        let whole = |f: Fold, errors| match f {
+            Fold::Unknown => open(errors),
+            f => Partial::Always(f),
+        };
+        Some(match data {
+            InstData::Binary { op, policy, args } => self.partial(*op, *policy, args),
+            InstData::Unary { op, policy, arg } => {
+                let ty = self.ty(*arg);
+                let errors = fold::error_kinds(data, ty);
+                match self.known(*arg) {
+                    Some(bits) => whole(fold::unary(*op, *policy, ty, bits), errors),
+                    None => open(errors),
                 }
             }
             InstData::Convert {
-                op: ConvOp::IntCast,
+                op,
+                policy,
                 to,
                 arg,
-                ..
             } => {
-                let from = func.value_type(*arg).unwrap_or(Type::Ptr);
-                !widens(from, *to)
+                let from = self.ty(*arg);
+                let errors = fold::error_kinds(data, from);
+                match self.known(*arg) {
+                    Some(bits) => whole(fold::convert(*op, *policy, from, *to, bits), errors),
+                    // A widening `int_cast` always fits.
+                    None if *op == ConvOp::IntCast && widens(from, *to) => open(0),
+                    None => open(errors),
+                }
             }
-            _ => true,
+            _ => open(fold::error_kinds(data, Type::Ptr)),
+        })
+    }
+
+    /// The `check` result, error-code cell, and feasible edges (normal, error)
+    /// implied by what is known about its operation.
+    fn outcome(&self, data: &InstData, p: Partial) -> (Cell, Cell, bool, bool) {
+        match p {
+            Partial::Always(Fold::Value(v)) => (konst(v), TOP_CELL, true, false),
+            Partial::Always(Fold::Error(e)) => (TOP_CELL, konst(u64::from(e.code())), false, true),
+            Partial::Always(Fold::Trap(_)) => (TOP_CELL, TOP_CELL, false, false),
+            Partial::Always(Fold::Unknown) => (BOTTOM_CELL, BOTTOM_CELL, true, true),
+            Partial::Operand(k) => {
+                let res = match data {
+                    InstData::Binary { args, .. } => {
+                        args.get(k).map_or(BOTTOM_CELL, |&v| self.cell(v))
+                    }
+                    _ => BOTTOM_CELL,
+                };
+                (res, TOP_CELL, true, false)
+            }
+            Partial::Open { value, errors } => {
+                let res = value.map_or(BOTTOM_CELL, konst);
+                if errors == 0 {
+                    (res, TOP_CELL, true, false)
+                } else {
+                    let err = if errors.count_ones() == 1 {
+                        konst(u64::from(errors.trailing_zeros()))
+                    } else {
+                        BOTTOM_CELL
+                    };
+                    (res, err, true, true)
+                }
+            }
+        }
+    }
+
+    /// The `check` result, error-code cell, and feasible edges (normal, error).
+    fn eval_check(&self, data: &InstData) -> (Cell, Cell, bool, bool) {
+        match self.check_partial(data) {
+            Some(p) => self.outcome(data, p),
+            None => (TOP_CELL, TOP_CELL, false, false),
         }
     }
 
@@ -622,24 +654,6 @@ fn widens(from: Type, to: Type) -> bool {
     }
 }
 
-/// Folds a `check`'s operation on constant operand bits.
-fn fold_check(func: &Function, op: &InstData, bits: [u64; 2]) -> Fold {
-    let ty = |v: Value| func.value_type(v).unwrap_or(Type::Ptr);
-    match op {
-        InstData::Unary { op, policy, arg } => fold::unary(*op, *policy, ty(*arg), bits[0]),
-        InstData::Binary { op, policy, args } => {
-            fold::binary(*op, *policy, ty(args[0]), bits[0], bits[1])
-        }
-        InstData::Convert {
-            op,
-            policy,
-            to,
-            arg,
-        } => fold::convert(*op, *policy, ty(*arg), *to, bits[0]),
-        _ => Fold::Unknown,
-    }
-}
-
 /// The result type of a `check`'s operation.
 fn check_result_type(func: &Function, op: &InstData) -> Option<Type> {
     match op {
@@ -650,13 +664,68 @@ fn check_result_type(func: &Function, op: &InstData) -> Option<Type> {
     }
 }
 
-/// The plain (non-raising) form of a `check`'s operation whose error cannot
-/// happen: the same result on every input the analysis allows.
-fn relaxed(op: &InstData) -> InstData {
-    let mut op = op.clone();
+/// The operand type that decides fallibility (the first operand's).
+fn operand_type(func: &Function, data: &InstData) -> Type {
+    let v = match data {
+        InstData::Unary { arg, .. } | InstData::Convert { arg, .. } => *arg,
+        InstData::Binary { args, .. } => args[0],
+        _ => return Type::Ptr,
+    };
+    func.value_type(v).unwrap_or(Type::Ptr)
+}
+
+/// ir-lang's placement rule: whether `data` must be the operation of a
+/// `check` (and can only be one).
+fn can_error(data: &InstData, ty: Type) -> bool {
+    match data {
+        InstData::Unary { op, policy, .. } => op.can_error(*policy),
+        InstData::Binary { op, policy, .. } => op.can_error(*policy, ty),
+        InstData::Convert { op, policy, .. } => op.can_error(*policy),
+        _ => true,
+    }
+}
+
+/// `x ** 2` as `x * x` under the same overflow policy: exactly equal under
+/// OPS (the same bits under `wrap`, the same overflow under `error` and
+/// `trap`, and no negative exponent). `None` for any other operation, or for
+/// `error` unless `allow_error` (the result must then stay in a `check`).
+fn square(data: &InstData, exponent: Option<u64>, ty: Type, allow_error: bool) -> Option<InstData> {
+    let InstData::Binary {
+        op: BinaryOp::Pow,
+        policy,
+        args,
+    } = data
+    else {
+        return None;
+    };
+    let o = policy.overflow?;
+    if !ty.is_int() || exponent != Some(2) || (o == Overflow::Error && !allow_error) {
+        return None;
+    }
+    Some(InstData::Binary {
+        op: BinaryOp::Mul,
+        policy: Policy::overflow(o),
+        args: [args[0], args[0]],
+    })
+}
+
+/// The plain (non-raising) form of a `check`'s operation that the analysis
+/// proved cannot raise, if the IR accepts one: the `error` fields turned into
+/// ones that act identically on every input the analysis allows, and a signed
+/// `saturate` shift by a known non-negative amount turned into `mask` (with
+/// the amount `width - 1` for an amount past the width, which gives the same
+/// sign fill). The second element is that replacement amount, if any.
+fn plain_form(
+    func: &Function,
+    data: &InstData,
+    rhs: Option<u64>,
+) -> Option<(InstData, Option<u64>)> {
+    let ty = operand_type(func, data);
+    let mut data = data.clone();
+    let mut amount = None;
     if let InstData::Unary { policy, .. }
     | InstData::Binary { policy, .. }
-    | InstData::Convert { policy, .. } = &mut op
+    | InstData::Convert { policy, .. } = &mut data
     {
         if policy.overflow == Some(Overflow::Error) {
             policy.overflow = Some(Overflow::Wrap);
@@ -668,7 +737,49 @@ fn relaxed(op: &InstData) -> InstData {
             policy.shift = Some(Shift::Mask);
         }
     }
-    op
+    if let InstData::Binary {
+        op: BinaryOp::Shl | BinaryOp::Shr,
+        policy,
+        ..
+    } = &mut data
+    {
+        if policy.shift == Some(Shift::Saturate) && ty.is_signed_int() {
+            let w = i128::from(ty.int_bits()?);
+            let y = fold::sval(ty, rhs?);
+            if y < 0 {
+                return None;
+            }
+            policy.shift = Some(Shift::Mask);
+            if y >= w {
+                amount = Some((w - 1) as u64);
+            }
+        }
+    }
+    if !can_error(&data, ty) {
+        return Some((data, amount));
+    }
+    square(&data, rhs, ty, false).map(|d| (d, None))
+}
+
+/// Whether `block` is an `unreachable` stub: no parameters, no instructions,
+/// terminated by `unreachable`.
+fn is_dead_stub(func: &Function, block: Block) -> bool {
+    func.block_params(block).is_empty()
+        && func.first_inst(block).is_none()
+        && matches!(func.terminator(block), Some(Terminator::Unreachable))
+}
+
+/// An existing reachable stub (not the entry, not a landing pad) to reuse for
+/// dead error edges.
+fn find_stub(func: &Function, cfg: &Cfg) -> Option<Block> {
+    cfg.rpo.iter().map(|&b| Block::from_u32(b)).find(|&b| {
+        b != func.entry()
+            && is_dead_stub(func, b)
+            && !cfg.preds(b.index()).iter().any(|e| {
+                func.terminator(Block::from_u32(e.from))
+                    .is_some_and(|t| is_unwind_edge(t, e.idx as usize))
+            })
+    })
 }
 
 /// `dest` with every `res0` / `err` argument replaced by `v`.
@@ -717,19 +828,31 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
         Param(Value, Type, u64),
         /// Replace an instruction's result with a constant and remove it.
         Inst(Inst, Value, Type, u64),
-        /// Replace a `select` with the chosen operand and remove it.
-        Select(Inst, Value, Value),
+        /// Replace an instruction's result with an existing value (the chosen
+        /// operand of a `select`, or `x` for `x ** 1`) and remove it.
+        Forward(Inst, Value, Value),
+        /// Replace an instruction's operation (`x ** 2` by `x * x`).
+        Replace(Inst, InstData),
         /// Replace a terminator.
         Term(Block, Term),
+        /// Point a `check`'s error edge, which cannot be taken, at the
+        /// `unreachable` stub.
+        DeadError(Block),
     }
     enum Term {
         Jump(BlockCall),
         /// Jump along `dest` with the produced argument a new constant.
         JumpWithConst(BlockCall, Type, u64),
-        /// Jump along `dest` with the produced argument the relaxed operation.
-        JumpWithOp(BlockCall, InstData),
+        /// Jump along `dest` with the produced argument an existing value.
+        JumpWithValue(BlockCall, Value),
+        /// Jump along `dest` with the produced argument the plain operation
+        /// (whose second operand becomes a new constant if one is given).
+        JumpWithOp(BlockCall, InstData, Option<u64>),
+        /// The same `check` with a cheaper operation.
+        CheckOp(InstData, BlockCall, BlockCall),
         Trap(u32),
     }
+    let stub = find_stub(func, &s.cfg);
     let mut plans: Vec<Plan> = Vec::new();
     for &bl in &s.cfg.rpo {
         let block = Block::from_u32(bl);
@@ -770,8 +893,21 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
                 if cc.state == CONST {
                     let chosen = func.resolve(if cc.bits & 1 == 1 { args[0] } else { args[1] });
                     if chosen != r {
-                        plans.push(Plan::Select(inst, r, chosen));
+                        plans.push(Plan::Forward(inst, r, chosen));
                     }
+                }
+            } else if let InstData::Binary { op, policy, args } = data {
+                // The identities need a known operand.
+                if !s.constable(r) || (s.known(args[0]).is_none() && s.known(args[1]).is_none()) {
+                    continue;
+                }
+                if let Partial::Operand(k) = s.partial(*op, *policy, args) {
+                    let v = func.resolve(args[k]);
+                    if v != r {
+                        plans.push(Plan::Forward(inst, r, v));
+                    }
+                } else if let Some(m) = square(data, s.known(args[1]), s.ty(args[0]), false) {
+                    plans.push(Plan::Replace(inst, m));
                 }
             }
         }
@@ -809,7 +945,14 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
                 }
             }
             Terminator::Check { op, normal, error } => {
-                let (res, err, n_ok, e_ok) = s.eval_check(op);
+                let Some(p) = s.check_partial(op) else {
+                    continue;
+                };
+                let (res, err, n_ok, e_ok) = s.outcome(op, p);
+                let rhs = match &**op {
+                    InstData::Binary { args, .. } => s.known(args[1]),
+                    _ => None,
+                };
                 match (n_ok, e_ok) {
                     (true, false) if res.state == CONST => {
                         if let Some(ty) = check_result_type(func, op) {
@@ -820,10 +963,28 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
                         }
                     }
                     (true, false) => {
-                        plans.push(Plan::Term(
-                            block,
-                            Term::JumpWithOp(normal.clone(), relaxed(op)),
-                        ));
+                        if let (Partial::Operand(k), InstData::Binary { args, .. }) = (p, &**op) {
+                            let v = func.resolve(args[k]);
+                            plans.push(Plan::Term(block, Term::JumpWithValue(normal.clone(), v)));
+                        } else if let Some((data, amount)) = plain_form(func, op, rhs) {
+                            plans.push(Plan::Term(
+                                block,
+                                Term::JumpWithOp(normal.clone(), data, amount),
+                            ));
+                        } else if !is_dead_stub(func, error.block) {
+                            // The operation must stay a `check`, but its error
+                            // edge cannot be taken.
+                            plans.push(Plan::DeadError(block));
+                        }
+                    }
+                    (true, true) => {
+                        let ty = operand_type(func, op);
+                        if let Some(m) = square(op, rhs, ty, true) {
+                            plans.push(Plan::Term(
+                                block,
+                                Term::CheckOp(m, normal.clone(), error.clone()),
+                            ));
+                        }
                     }
                     (false, true) if err.state == CONST => {
                         plans.push(Plan::Term(
@@ -832,19 +993,7 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
                         ));
                     }
                     (false, false) => {
-                        // Every operand is known and the operation traps.
-                        let mut bits = [0u64; 2];
-                        let mut n = 0;
-                        let mut known = true;
-                        op.for_each_operand(|v| {
-                            let c = s.cell(v);
-                            known &= c.state == CONST;
-                            if let Some(slot) = bits.get_mut(n) {
-                                *slot = c.bits;
-                            }
-                            n += 1;
-                        });
-                        if let (true, Fold::Trap(e)) = (known, fold_check(func, op, bits)) {
+                        if let Partial::Always(Fold::Trap(e)) = p {
                             plans.push(Plan::Term(block, Term::Trap(e.code())));
                         }
                     }
@@ -858,6 +1007,7 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
     if plans.is_empty() {
         return Ok(false);
     }
+    let mut stub = stub;
     for plan in plans {
         match plan {
             Plan::Param(p, ty, bits) => {
@@ -873,9 +1023,27 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
                 b.replace_all_uses(r, c)?;
                 b.remove_inst(inst)?;
             }
-            Plan::Select(inst, r, chosen) => {
-                b.replace_all_uses(r, chosen)?;
+            Plan::Forward(inst, r, v) => {
+                b.replace_all_uses(r, v)?;
                 b.remove_inst(inst)?;
+            }
+            Plan::Replace(inst, data) => b.replace_inst(inst, data)?,
+            Plan::DeadError(block) => {
+                let target = match stub {
+                    Some(t) => t,
+                    None => {
+                        let t = b.create_block(&[])?;
+                        b.switch_to(t)?;
+                        b.unreachable()?;
+                        stub = Some(t);
+                        t
+                    }
+                };
+                rewrite_terminator(b, block, |term| {
+                    if let Terminator::Check { error, .. } = term {
+                        *error = BlockCall::new(target, &[]);
+                    }
+                })?;
             }
             Plan::Term(block, Term::Jump(dest)) => {
                 replace_terminator(b, block, Terminator::Jump(dest))?;
@@ -884,7 +1052,28 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
                 let c = constant(b, Position::End(block), ty, bits)?;
                 replace_terminator(b, block, Terminator::Jump(substitute(&dest, c)))?;
             }
-            Plan::Term(block, Term::JumpWithOp(dest, op)) => {
+            Plan::Term(block, Term::JumpWithValue(dest, v)) => {
+                replace_terminator(b, block, Terminator::Jump(substitute(&dest, v)))?;
+            }
+            Plan::Term(block, Term::CheckOp(op, normal, error)) => {
+                replace_terminator(
+                    b,
+                    block,
+                    Terminator::Check {
+                        op: alloc::boxed::Box::new(op),
+                        normal,
+                        error,
+                    },
+                )?;
+            }
+            Plan::Term(block, Term::JumpWithOp(dest, mut op, amount)) => {
+                if let (Some(bits), InstData::Binary { args, .. }) = (amount, &mut op) {
+                    let ty = b
+                        .func()
+                        .value_type(args[1])
+                        .ok_or(BuildError::UnknownValue { value: args[1] })?;
+                    args[1] = constant(b, Position::End(block), ty, bits)?;
+                }
                 b.set_position(Position::End(block))?;
                 let inst = b.insert(op)?;
                 let v = b

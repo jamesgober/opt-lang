@@ -38,7 +38,7 @@
 //! | Pass | What it does |
 //! |---|---|
 //! | [`PassKind::SimplifyCfg`] | folds constant and trivial branches, removes unreachable blocks, threads jumps through empty blocks, merges straight-line blocks |
-//! | [`PassKind::Sccp`] | sparse conditional constant propagation over block parameters, `switch`, and `check` edges, folding with the exact OPS policies |
+//! | [`PassKind::Sccp`] | sparse conditional constant propagation over block parameters, `switch`, and `check` edges, folding with the exact OPS policies (OPS v2 `pow` and `saturate` included), also when only some operands are known |
 //! | [`PassKind::CopyProp`] | replaces block parameters that always receive one value, and removes them |
 //! | [`PassKind::Gvn`] | dominator-based value numbering of pure operations |
 //! | [`PassKind::Licm`] | hoists pure loop-invariant operations into preheaders |
@@ -61,13 +61,24 @@
 //! - **The IR stays valid**: every pass leaves the function valid under
 //!   [`ir_lang::Module::validate`], including the safepoint rules for GC
 //!   references. The validator runs after every pass in debug builds and tests.
+//!   A `check` becomes a plain instruction only when ir-lang's placement rule
+//!   (`can_error`) accepts it; an error edge that can be taken is never
+//!   removed.
+//! - **Statepoints are kept by construction**: no pass moves a call or
+//!   safepoint, edits a GC list, or makes a `ref` (or a value derived from one)
+//!   a constant, numbered, or hoisted, so input whose statepoints came from
+//!   `Builder::insert_statepoints` stays valid without running it again. The
+//!   tests check that running it on optimized output adds nothing.
 //! - **Bounded work**: every pass is iterative (no recursion over the input) and
 //!   draws from a [`Budget`]; a function whose budget runs out is left valid and
 //!   partly optimized.
 //!
 //! What is not done yet: no memory optimizations (loads are not value-numbered
 //! or forwarded, stores are not removed), no inlining, no SROA, no strength
-//! reduction, and `fma` is not constant-folded. See `dev/ROADMAP.md`.
+//! reduction beyond `x ** 2` to `x * x`, and `fma` is not constant-folded.
+//! See `dev/ROADMAP.md`.
+//!
+//! The IR is `ir-lang` `=2.0.0-alpha.3`; callers must use the same release.
 //!
 //! ## Features
 //!

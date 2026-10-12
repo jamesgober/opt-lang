@@ -68,9 +68,91 @@ Moved out of 0.2.0 (anti-deferral record):
   verified on its own. Until then `fma` is evaluated at run time (correct, just not
   folded).
 
+## v0.3.0 - ir-lang alpha.3 and OPS v2 (DONE, 2026-10-12)
+Unblocks the native path (ISSUES P37, opt-lang's half): opt-lang 0.2 and
+backend-lang 0.3 pinned ir-lang alpha.1 while irgen-lang 0.2 emits alpha.2.
+Exit criteria:
+- [x] `ir-lang = "=2.0.0-alpha.3"` (regular and dev with `interp`).
+- [x] The 0.2 rewrite workarounds replaced by `Builder::remove_block_params` and
+      `Builder::move_inst`, and the difference measured.
+- [x] OPS v2 (`pow`, `shift = saturate`) in every pass: folding exactly per
+      policy (floats via `ls_pow`), no error edge that can fire is folded away,
+      a `check` becomes plain only where `can_error` allows, identities
+      property-tested against the interpreter.
+- [x] No pass breaks the statepoint (GC-list) invariants; the validator is the
+      oracle.
+- [x] Differential tests extended to OPS v2 and to programs built with the
+      variable API; hostile and huge inputs; property tests for the new folds.
+
+Delivered:
+- OPS v2 folding in `fold.rs`: integer `pow` (repeated squaring, overflow per
+  policy, a negative exponent is `NegativeExponent` under every policy, P36),
+  float `pow` via `ir_lang::ls_pow` (in `core`, so `no_std` folds it), and
+  `saturate` shifts; `error_kinds` takes the operand type and is tested equal
+  to ir-lang's `can_error` for every operation, policy, and type.
+- Partial folding (`fold::binary_partial`): constants, operand identities, and
+  the error kinds still possible when only some operands are known. Used by
+  SCCP for plain instructions and for `check` edges (feasible edges, known
+  error code, normal-edge constant such as `1 ** y`).
+- `check` rewrites under ir-lang's placement rule: plain only when
+  `can_error` accepts the plain form; `x ** 2` -> `x * x` (plain under
+  `wrap`/`trap`, `check mul` under `error`); signed `saturate` shifts by known
+  non-negative amounts -> `mask` shifts; a `check` that must stay but cannot
+  raise has its dead error edge redirected to a shared `unreachable` stub.
+- GVN `x ** 1 = x`.
+- `move_inst` in LICM and block merging; `remove_block_params` in DCE and copy
+  propagation. Measured (criterion, same machine, against 0.2's code on
+  alpha.3; this machine's run-to-run spread is about 10%): block merging 32-53%
+  faster on a merge-heavy shape and `simplify-cfg` 23% on the typical shape,
+  LICM 18-28%; parameter removal from no change to 16% faster (the rebuild
+  path was already linear), with blocks keeping their handles. The whole
+  pipeline went from ~69 ms / ~1.12 s (0.2.0's published run) to ~43 ms /
+  ~0.89 s at 100k / 1M instructions.
+- Tests: `tests/variables.rs` (variable-API programs with OPS v2 checks and
+  statepoints from `insert_statepoints`), generator with `pow`/`saturate`,
+  `insert_statepoints` adds nothing after optimization (GC and variable
+  programs), OPS v2 pass tests, hostile `check pow` chains and huge exponents,
+  partial-fold properties; `edit` benchmark group; `variables` example.
+
+Statepoints (decision recorded here): the passes keep the GC-list invariants by
+construction (no call or safepoint is moved, no GC list is edited, tracked
+values are never made constant, numbered, or hoisted, and every forwarding
+keeps uses in place). `insert_statepoints` is **not** re-run after the passes:
+it would only cost time, since its input is already valid. Instead the tests
+run it on every optimized GC and variable program and require it to add
+nothing, beside the validator after every pass.
+
+Dependency wiring:
+- **ir-lang: `=2.0.0-alpha.3`** (exact pin, pre-release), regular without
+  default features, dev with `interp`. Folding still does not call
+  `ir_lang::interp::eval_*` at run time (`interp` requires `std`; opt-lang is
+  `no_std`); it implements the semantics in `core` and is tested against
+  `eval_*`, as in 0.2. Float `pow` calls `ir_lang::ls_pow` directly (it is in
+  `core`).
+- **pass-lang: `1`**, unchanged.
+- **irgen-lang: not wired** (dev-dependency for realistic input was requested).
+  irgen-lang 0.2.0 pins `ir-lang = "=2.0.0-alpha.2"`; Cargo cannot hold two
+  semver-compatible pre-releases of one crate, so adding it next to opt-lang's
+  `=2.0.0-alpha.3` fails to resolve (checked: "failed to select a version for
+  `ir-lang`"). `tests/variables.rs` builds the same kind of input (the SSA
+  variable API, `check`ed OPS v2 operations, statepoints) directly. Wire
+  irgen-lang as a dev-dependency once it is released on alpha.3 (irgen 0.3,
+  which also adds the native end-to-end test, P37).
+
+Found, not fixed here (another crate):
+- ir-lang 2.0.0-alpha.3's validator is quadratic on a deep chain of blocks
+  whose error edges all join one handler (measured in a debug build: 5,000
+  `check`s 0.3 s, 10,000 1.2 s, 20,000 6.7 s), and every optimizer run
+  validates its input. That shape is what a front end produces for a long
+  function whose fallible operations share one error handler. opt-lang's own
+  analyses are linear on it (Lengauer-Tarjan dominators). The hostile tests use
+  5,000-long chains for this reason. Reported for the ISSUES ledger.
+
 ## v0.5.0 - Implementation
 - [ ] Inlining (budgeted, `inline`/`noinline` hints, cost model), SROA of stack aggregates
-      (mem2reg), loop canonicalization (dedicated exits), strength reduction.
+      (mem2reg), loop canonicalization (dedicated exits), strength reduction
+      (0.3.0 already turns `x ** 2` into `x * x`; general `pow` by a constant
+      exponent, multiplication by constants, and induction variables are here).
 - [ ] Memory optimizations with an alias analysis: redundant load elimination and
       store-to-load forwarding, dead store elimination. (Not in 0.2.0's scope: they need
       memory dependence information that does not exist yet; GVN deliberately skips loads.)

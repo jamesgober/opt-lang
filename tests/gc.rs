@@ -240,6 +240,14 @@ fn check(seed: u64, x: i64) {
         .unwrap_or_else(|e| panic!("{e}\n{m}"));
     opt.validate().unwrap();
     assert_eq!(run(&opt, f, x), expect, "\n{m}\n{opt}");
+    // Statepoint insertion finds nothing to add: no pass left a reference live
+    // across a safepoint outside its GC list.
+    let sp = opt.edit(f).unwrap().insert_statepoints().unwrap();
+    assert_eq!(
+        (sp.safepoints, sp.relocations, sp.params),
+        (0, 0, 0),
+        "{opt}"
+    );
     for kind in PassKind::ALL {
         let mut one = m.clone();
         let mut budget = Budget::unlimited();

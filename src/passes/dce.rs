@@ -105,6 +105,6 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
     for inst in dead_insts {
         b.remove_inst(inst)?;
     }
-    remove_params(b, &cfg, &plans)?;
+    remove_params(b, &plans)?;
     Ok(changed)
 }

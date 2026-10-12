@@ -11,9 +11,11 @@
 //! A few algebraic identities that never change a result or a trap are applied
 //! on the way (integers and `bool` only): `x + 0`, `x - 0`, `x * 1`, `x / 1`,
 //! `x | 0`, `x ^ 0`, `x & -1`, `x & x`, `x | x`, `min(x, x)`, `max(x, x)`,
-//! `x << 0`, `x >> 0`, `not(not(x))`, `select(c, x, x)`, a `bitcast` back to the
-//! original type, and a `narrow` of a `zext`/`sext` back to the original type.
-//! Float identities are not applied (`x + 0.0` is not `x` for `x = -0.0`).
+//! `x << 0`, `x >> 0` (every shift policy, `saturate` included), `x ** 1`,
+//! `not(not(x))`, `select(c, x, x)`, a `bitcast` back to the original type, and
+//! a `narrow` of a `zext`/`sext` back to the original type. Float identities
+//! are not applied (`x + 0.0` is not `x` for `x = -0.0`, and `x ** 1` would
+//! not quiet a signaling NaN).
 //!
 //! Loads are not numbered (there is no memory dependence analysis yet), nor are
 //! values of type `ref` or derived from one (their liveness is constrained by the
@@ -176,7 +178,7 @@ impl Gvn<'_> {
                     BinaryOp::Sub | BinaryOp::Shl | BinaryOp::Shr if cb == Some(0) => Some(a),
                     BinaryOp::Mul if cb == Some(1) => Some(a),
                     BinaryOp::Mul if ca == Some(1) => Some(b),
-                    BinaryOp::Div | BinaryOp::FloorDiv if cb == Some(1) => Some(a),
+                    BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::Pow if cb == Some(1) => Some(a),
                     BinaryOp::And if cb == Some(ones) => Some(a),
                     BinaryOp::And if ca == Some(ones) => Some(b),
                     BinaryOp::And | BinaryOp::Or | BinaryOp::Min | BinaryOp::Max if a == b => {

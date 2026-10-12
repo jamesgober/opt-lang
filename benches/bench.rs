@@ -101,6 +101,49 @@ fn bench_passes(c: &mut Criterion) {
     group.finish();
 }
 
+/// The two bulk rewrites every optimizer needs, on shapes that stress them:
+/// removing many block parameters (DCE on a chain of blocks with dead
+/// parameters) and moving many instructions (CFG simplification merging a long
+/// chain of blocks).
+fn bench_edits(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edit");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+    let cases = [
+        (
+            "dce-dead-params",
+            PassKind::Dce,
+            shapes::dead_params(50_000, 8),
+        ),
+        (
+            "simplify-cfg-merge",
+            PassKind::SimplifyCfg,
+            shapes::chain(50_000, 4),
+        ),
+    ];
+    for (name, kind, (m, f)) in cases {
+        group.throughput(Throughput::Elements(insts(&m)));
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || m.clone(),
+                |mut m| {
+                    let stats = Optimizer::new()
+                        .passes(&[kind])
+                        .max_iterations(1)
+                        .validate(false)
+                        .compact(false)
+                        .run_function(&mut m, f)
+                        .unwrap();
+                    black_box(stats);
+                    m
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn bench_validation_overhead(c: &mut Criterion) {
     // The cost of `run_pass`, which validates before and (in debug builds)
     // after the pass.
@@ -128,6 +171,7 @@ criterion_group!(
     benches,
     bench_pipeline,
     bench_passes,
+    bench_edits,
     bench_validation_overhead
 );
 criterion_main!(benches);

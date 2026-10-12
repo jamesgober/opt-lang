@@ -192,6 +192,6 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
     for (p, v) in forward {
         b.replace_all_uses(p, v)?;
     }
-    remove_params(b, &cfg, &plans)?;
+    remove_params(b, &plans)?;
     Ok(true)
 }

@@ -212,6 +212,117 @@ fn test_a_huge_switch() {
     let _ = interp::run(&m, f, &[Val::u32(5)]).unwrap();
 }
 
+/// The length of the `check pow` chains. Shorter than `DEPTH`: ir-lang
+/// 2.0.0-alpha.3's validator is quadratic on a deep chain of blocks whose
+/// error edges all join in one handler (5k: 0.3 s, 10k: 1.2 s, 20k: 6.7 s in
+/// a debug build, measured while writing these tests), and the optimizer
+/// validates its input. opt-lang's own analyses are linear on this shape.
+const POW_CHAIN: usize = 5_000;
+
+/// `POW_CHAIN` chained `check pow` terminators on a signed value, every error
+/// edge into one handler; `exponent` is the constant exponent, or `None` for
+/// the function's second parameter.
+fn pow_chain(exponent: Option<i64>, overflow: Overflow) -> (Module, FuncId) {
+    let (mut m, f) = func(&[Type::I64, Type::I64], &[Type::I64]);
+    let mut b = m.build(f).unwrap();
+    let mut x = b.param(0).unwrap();
+    let e = match exponent {
+        Some(k) => b.iconst(Type::I64, i128::from(k)).unwrap(),
+        None => b.param(1).unwrap(),
+    };
+    let handler = b.create_block(&[Type::U32]).unwrap();
+    for _ in 0..POW_CHAIN {
+        let ok = b.create_block(&[Type::I64]).unwrap();
+        b.check(
+            ir_lang::InstData::Binary {
+                op: ir_lang::BinaryOp::Pow,
+                policy: ir_lang::Policy::overflow(overflow),
+                args: [x, e],
+            },
+            BlockCall::with_args(ok, &[ir_lang::BlockArg::Result(0)]),
+            BlockCall::with_args(handler, &[ir_lang::BlockArg::ErrorCode]),
+        )
+        .unwrap();
+        b.switch_to(ok).unwrap();
+        x = b.block_param(ok, 0).unwrap();
+    }
+    b.ret(&[x]).unwrap();
+    b.switch_to(handler).unwrap();
+    let code = b.block_param(handler, 0).unwrap();
+    let wide = b
+        .convert(
+            ir_lang::ConvOp::Zext,
+            ir_lang::Policy::NONE,
+            code,
+            Type::I64,
+        )
+        .unwrap();
+    b.ret(&[wide]).unwrap();
+    (m, f)
+}
+
+#[test]
+fn test_a_long_chain_of_pow_checks() {
+    // `x ** 3` under `wrap`, 5,000 times: no error edge can fire, but signed
+    // `pow` must stay a `check`. Every error edge moves to one shared stub,
+    // the handler goes, and the checks stay.
+    let (mut m, f) = pow_chain(Some(3), Overflow::Wrap);
+    let stats = optimize_and_check(&mut m, f, &[Val::i64(3), Val::i64(0)]);
+    let text = m.to_string();
+    assert_eq!(text.matches("unreachable").count(), 1);
+    assert!(!text.contains("zext"));
+    assert_eq!(text.matches("check pow").count(), POW_CHAIN);
+    assert_eq!(stats.converged(), 1);
+}
+
+#[test]
+fn test_a_long_chain_of_squares() {
+    // `x ** 2`: every check becomes a plain `mul`, the chain one block.
+    let (mut m, f) = pow_chain(Some(2), Overflow::Trap);
+    let stats = optimize_and_check(&mut m, f, &[Val::i64(1), Val::i64(0)]);
+    assert_eq!(stats.blocks_after(), 1);
+}
+
+#[test]
+fn test_a_long_chain_of_negative_exponents() {
+    // `x ** -1`: the first check always raises; the rest is unreachable.
+    let (mut m, f) = pow_chain(Some(-1), Overflow::Trap);
+    let stats = optimize_and_check(&mut m, f, &[Val::i64(5), Val::i64(0)]);
+    assert!(stats.insts_after() <= 2, "{}", m);
+}
+
+#[test]
+fn test_a_long_chain_of_unknown_exponents() {
+    // An unknown exponent: every error edge can fire and stays.
+    let (mut m, f) = pow_chain(None, Overflow::Wrap);
+    let _ = optimize_and_check(&mut m, f, &[Val::i64(1), Val::i64(2)]);
+    let _ = interp::run(&m, f, &[Val::i64(2), Val::i64(-1)]).unwrap();
+    assert!(!m.to_string().contains("unreachable"));
+}
+
+#[test]
+fn test_huge_pow_exponents_fold_in_bounded_time() {
+    // `pow` folding is repeated squaring: 64 rounds at most, whatever the
+    // exponent.
+    let (mut m, f) = func(&[], &[Type::U64]);
+    let mut b = m.build(f).unwrap();
+    let mut acc = b.iconst(Type::U64, 3).unwrap();
+    let e = b.iconst(Type::U64, i128::from(u64::MAX)).unwrap();
+    for _ in 0..10_000 {
+        acc = b
+            .binary(
+                ir_lang::BinaryOp::Pow,
+                ir_lang::Policy::overflow(Overflow::Wrap),
+                acc,
+                e,
+            )
+            .unwrap();
+    }
+    b.ret(&[acc]).unwrap();
+    let stats = optimize_and_check(&mut m, f, &[]);
+    assert_eq!(stats.insts_after(), 1);
+}
+
 #[test]
 fn test_thousands_of_dead_parameters() {
     let (mut m, f) = func(&[Type::I64], &[Type::I64]);

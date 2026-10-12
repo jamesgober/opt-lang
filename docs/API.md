@@ -1,7 +1,7 @@
 # opt-lang &mdash; API Reference
 
 > Complete reference for every public item in `opt-lang`, with examples.
-> **Status: pre-1.0 (0.2.0).** The surface is designed across the 0.x series
+> **Status: pre-1.0 (0.3.0).** The surface is designed across the 0.x series
 > and frozen at `1.0.0`, once a backend consumes optimized IR in production
 > (LexerSketch decision D18). See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
@@ -16,7 +16,8 @@
   - [The pipeline](#the-pipeline)
   - [What is preserved](#what-is-preserved)
   - [Constant folding and policies](#constant-folding-and-policies)
-  - [GC references](#gc-references)
+  - [OPS v2: `pow` and `saturate`](#ops-v2-pow-and-saturate)
+  - [GC references and statepoints](#gc-references-and-statepoints)
   - [Budgets](#budgets)
   - [Validation](#validation)
   - [Handles and compaction](#handles-and-compaction)
@@ -53,9 +54,12 @@ runs a single pass on an `ir_lang::Builder`.
 
 ```toml
 [dependencies]
-opt-lang = "0.2"
-ir-lang  = "=2.0.0-alpha.1"
+opt-lang = "0.3"
+ir-lang  = "=2.0.0-alpha.3"
 ```
+
+opt-lang's API takes and returns `ir_lang` types, so the program must use the
+same `ir-lang` release: `=2.0.0-alpha.3` for opt-lang 0.3.
 
 ## Quick start
 
@@ -123,7 +127,7 @@ result is the bits the reference interpreter would compute at run time:
 - An operation whose `error` policy fires is never a value. Inside a `check`
   it becomes a jump along the error edge, passing the OPS code (`1`
   `ArithOverflow`, `2` `DivByZero`, `3` `ShiftOutOfRange`, `4`
-  `InvalidConversion`, `5` `InvalidChar`).
+  `InvalidConversion`, `5` `InvalidChar`, `6` `NegativeExponent`).
 - An operation whose `trap` policy fires is never a value either: a plain
   instruction stays as it is (it traps at run time), and a `check` becomes a
   `trap` terminator with the same code.
@@ -133,12 +137,23 @@ result is the bits the reference interpreter would compute at run time:
   when the bits are a NaN.
 - `fma`, and conversions to or from `ptr` and `ref`, are not folded.
 
+With only some operands constant, an operation is still folded as far as OPS
+allows, under every policy: `x + 0`, `x - 0`, `x * 1`, `x / 1`, a shift by
+zero, and `x ** 1` are `x`; `x * 0` and `x ** 0` are constants (`0 ** 0` is
+`1`); a division by a constant zero, a constant out-of-range shift under
+`error`, and a negative constant exponent always raise. Inside a `check` this
+decides which edges can be taken: the normal edge receives the constant or the
+operand, or control goes straight to the error edge with the code.
+
 A `check` whose operation provably cannot fail, given the constants known
 about its operands, becomes the plain operation and a jump: adding or
 subtracting a constant zero, multiplying by a constant zero or one, a shift by
 a constant amount within the width, a division or remainder by a constant
 other than `0` (and `-1` for a signed division), and an `int_cast` to a type
-that holds every value of the source type.
+that holds every value of the source type. **The plain form is used only when
+ir-lang's placement rule (`can_error(policy, type)`) accepts it;** otherwise
+the `check` stays (see below). An error edge that can be taken is never
+removed or redirected.
 
 ```rust
 use ir_lang::{BinaryOp, BlockArg, BlockCall, InstData, Linkage, Module, Overflow, Policy, Signature, Type};
@@ -170,13 +185,89 @@ assert!(text.contains("div<overflow=wrap,div_zero=trap>"));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-### GC references
+### OPS v2: `pow` and `saturate`
+
+Integer `pow` is folded exactly (repeated squaring; overflow per policy; a
+negative exponent is the `NegativeExponent` error, code 6, under **every**
+policy, `trap` included, as OPS section 6 and ir-lang 2.0.0-alpha.3 define
+it). Float `pow` is folded with ir-lang's `ls_pow`, the routine every tier
+shares, so the folded bits are the run-time bits; a NaN result is not folded.
+`shl`/`shr` under `shift = saturate` fold to `0` (or the sign fill for a
+signed right shift) for an amount at least the width; a negative amount is
+`ShiftOutOfRange`.
+
+ir-lang makes a signed `pow` (any policy) and a signed `saturate` shift
+fallible, so they are always the operation of a `check`. With a constant
+exponent or amount, SCCP rewrites them:
+
+| Input (signed) | Result |
+|---|---|
+| `check pow x, 0` | jump with the constant `1` |
+| `check pow x, 1` | jump with `x` |
+| `check pow x, -k` | jump to the error edge with code 6 |
+| `check pow<wrap or trap> x, 2` | plain `mul<same policy> x, x` and a jump |
+| `check pow<error> x, 2` | `check mul<overflow=error> x, x` (same edges) |
+| `check pow<wrap or trap> x, n` (n >= 3) | the `check` stays (it is the only valid form), but its error edge, which cannot be taken, goes to an `unreachable` block shared by the function, so the old error handler can be deleted |
+| `check pow<error> x, n` (n >= 3) | unchanged, with the error code on the error edge known to be `1` |
+| `check pow 1, y` (`y` unknown) | unchanged, but the normal edge receives the constant `1` |
+| `check shl/shr<saturate> x, n` (0 <= n < width) | plain `shl/shr<shift=mask>` |
+| `check shl<saturate> x, n` (n >= width) | jump with the constant `0` |
+| `check shr<saturate> x, n` (n >= width) | plain `shr<shift=mask> x, width - 1` (the sign fill) |
+
+Unsigned `pow` and unsigned `saturate` shifts are plain instructions; the same
+identities apply to them (`x ** 0` is `1`, `x ** 1` is `x`, `x ** 2` is
+`mul x, x`, `1 ** y` is `1`, a `saturate` shift by at least the width is `0`).
+Every rule is checked against the interpreter for every policy and type.
+
+```rust
+use ir_lang::{BinaryOp, BlockArg, BlockCall, InstData, Linkage, Module, Overflow, Policy, Signature, Type};
+
+// x ** 3 on i64 under wrap: the check must stay (signed pow is fallible), but
+// its error edge cannot be taken, so the handler is deleted.
+let mut m = Module::new("m");
+let f = m.declare_function("f", &Signature::new(&[Type::I64], &[Type::I64]), Linkage::Export)?;
+let mut b = m.build(f)?;
+let x = b.param(0)?;
+let three = b.iconst(Type::I64, 3)?;
+let ok = b.create_block(&[Type::I64])?;
+let err = b.create_block(&[Type::U32])?;
+b.check(
+    InstData::Binary { op: BinaryOp::Pow, policy: Policy::overflow(Overflow::Wrap), args: [x, three] },
+    BlockCall::with_args(ok, &[BlockArg::Result(0)]),
+    BlockCall::with_args(err, &[BlockArg::ErrorCode]),
+)?;
+b.switch_to(ok)?;
+let cube = b.block_param(ok, 0)?;
+b.ret(&[cube])?;
+b.switch_to(err)?;
+b.trap(99)?;
+
+opt_lang::optimize(&mut m)?;
+let text = m.display_function(f).to_string();
+assert!(text.contains("check pow<overflow=wrap>"));
+assert!(text.contains("unreachable") && !text.contains("trap 99"));
+m.validate()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+### GC references and statepoints
 
 A `ref`, and every value derived from one (`ref_to_ptr`, and anything
 computed from a derived value or passed through a block parameter), is never
 turned into a constant, value-numbered, or hoisted: any of those could keep it
 live across a safepoint, which the IR's safepoint rules forbid. Such values
 are still removed when dead.
+
+The passes keep the statepoint invariants by construction rather than by
+running `Builder::insert_statepoints` again afterwards: no pass moves a call
+or `safepoint` instruction, changes a GC list, or makes a tracked value live
+anywhere it was not (forwarding a block parameter to the one value it always
+receives, or a `select` to its chosen operand, keeps every use where it was,
+and a value listed at a safepoint stays listed). Input that came from
+`insert_statepoints` (or a front end that lists references itself) stays
+valid. The validator is the oracle: it runs after every pass in the tests,
+and the tests also run `insert_statepoints` on every optimized function and
+require it to find nothing to add.
 
 ### Budgets
 
@@ -439,9 +530,9 @@ it changed anything, and is idempotent (a second run changes nothing).
 | Variant | Name | What it does | Cost |
 |---|---|---|---|
 | `SimplifyCfg` | `simplify-cfg` | Folds a branch on a constant, or with two identical edges, into a jump; folds a switch on a constant; drops switch cases that go where the default goes; removes unreachable blocks; threads edges through empty blocks that only jump on (substituting their parameters; never an unwind edge, never past a block whose parameter is used elsewhere); merges a block into its only predecessor when that predecessor jumps to it. Repeats until nothing changes. | Linear per round; at most 8 rounds per run. |
-| `Sccp` | `sccp` | Sparse conditional constant propagation (Wegman–Zadeck) over block parameters and executable edges, including `switch` and `check` edges; see [Constant folding and policies](#constant-folding-and-policies). Leaves unreachable code for `SimplifyCfg`. | Linear (each value is lowered at most twice, each edge becomes executable once). |
+| `Sccp` | `sccp` | Sparse conditional constant propagation (Wegman–Zadeck) over block parameters and executable edges, including `switch` and `check` edges, with partial folding of operations whose operands are only partly known; see [Constant folding and policies](#constant-folding-and-policies) and [OPS v2](#ops-v2-pow-and-saturate). Leaves unreachable code for `SimplifyCfg`; may add one `unreachable` block per function as the target of dead error edges. | Linear (each value is lowered at most twice, each edge becomes executable once). |
 | `CopyProp` | `copy-prop` | Replaces a block parameter that receives the same value on every edge from reachable code (edges passing the parameter back to itself are ignored), then removes it; re-examines the parameters that fed on it. | Linear, plus budgeted re-examination. |
-| `Gvn` | `gvn` | Dominator-based value numbering of pure operations (constants, arithmetic without trapping policies, comparisons, conversions, `select`, `fma`, address computation); commutative integer operations and comparisons are canonicalized. Applies exact integer identities: `x + 0`, `x - 0`, `x * 1`, `x / 1`, `x \| 0`, `x ^ 0`, `x & -1`, `x & x`, `x \| x`, `min(x, x)`, `max(x, x)`, shifts by zero, `not(not(x))`, `select(c, x, x)`, a `bitcast` back to the original type, a `narrow` of a `zext`/`sext` back to the original type. Loads are not numbered. | Linear; hash-table probes are capped. |
+| `Gvn` | `gvn` | Dominator-based value numbering of pure operations (constants, arithmetic without trapping policies, comparisons, conversions, `select`, `fma`, address computation); commutative integer operations and comparisons are canonicalized. Applies exact integer identities: `x + 0`, `x - 0`, `x * 1`, `x / 1`, `x \| 0`, `x ^ 0`, `x & -1`, `x & x`, `x \| x`, `min(x, x)`, `max(x, x)`, shifts by zero (every shift policy), `x ** 1`, `not(not(x))`, `select(c, x, x)`, a `bitcast` back to the original type, a `narrow` of a `zext`/`sext` back to the original type. Loads are not numbered. | Linear; hash-table probes are capped. |
 | `Licm` | `licm` | Hoists pure loop-invariant operations (the set GVN numbers) into the loop's preheader, creating one when the loop has something to hoist and no single outside predecessor ending in a jump; inner loops first. | Linear plus the sizes of nested loop bodies (budgeted). |
 | `Dce` | `dce` | Removes instructions without side effects whose results are unused, and block parameters that are never used (including loop variables only passed around their loop). Keeps calls, stores, atomics, fences, bulk memory, volatile loads, safepoints, and every operation with a trapping policy. | Linear. |
 
@@ -676,7 +767,10 @@ assert_eq!(DEFAULT_STEPS_PER_UNIT, 256);
 | `SimplifyCfg` rounds per run | 8 |
 | GVN hash-table probe | 16 colliding entries (past that, a redundancy is missed, not searched for) |
 | Default budget | 256 steps per unit of size + 65,536, per function |
-| Bulk parameter removal | Up to 16 parameters per pass run with the builder's `remove_block_param`; more by rebuilding the blocks (linear in their edges and instructions) |
+| Bulk parameter removal | One `Builder::remove_block_params` call per pass run: linear in the function, however many parameters go |
+| Instruction moves (LICM, block merging) | `Builder::move_inst`, O(1) each; handles and results are kept |
+| Integer `pow` folding | At most 64 squaring rounds, whatever the exponent |
+| Input validation | ir-lang 2.0.0-alpha.3's validator, which the optimizer runs on every input, is quadratic on a deep chain of blocks whose error edges all join one handler (measured: 5,000 checks 0.3 s, 20,000 checks 6.7 s in a debug build); opt-lang's own passes are linear on that shape |
 
 ## Stability
 
@@ -684,5 +778,6 @@ This is a 0.x release: the surface may change in a minor release before
 `1.0.0`, and every change is recorded in [`../CHANGELOG.md`](../CHANGELOG.md).
 `PassKind` and `OptError` are `#[non_exhaustive]`, so new passes and error
 kinds are additive. The dependency on `ir-lang` is pinned to
-`=2.0.0-alpha.1` because that release is a pre-release; it moves with
-ir-lang's 2.0 series.
+`=2.0.0-alpha.3` because that release is a pre-release; it moves with
+ir-lang's 2.0 series, and each move is a breaking release of opt-lang (the
+`ir_lang` types in its signatures change with it).

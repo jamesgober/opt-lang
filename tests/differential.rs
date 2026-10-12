@@ -173,3 +173,29 @@ fn test_optimization_actually_happens() {
         assert!(changed[k] > 0, "{kind} never changed anything");
     }
 }
+
+#[test]
+fn test_ops_v2_rewrites_happen() {
+    // The generator's `pow` and `saturate` forms reach every new rewrite: some
+    // `check pow` disappears, some becomes `mul`, and some keeps its `check`
+    // with the dead error edge sent to an `unreachable` stub.
+    let (mut pows_before, mut pows_after, mut stubs, mut muls, mut saturates) = (0, 0, 0, 0, 0);
+    for seed in 0..300u64 {
+        let p = generate(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) + 3);
+        let before = p.module.to_string();
+        let mut m = p.module.clone();
+        Optimizer::new().validate(true).run(&mut m).unwrap();
+        let after = m.to_string();
+        pows_before += before.matches("pow<").count();
+        pows_after += after.matches("pow<").count();
+        stubs += usize::from(!before.contains("unreachable") && after.contains("unreachable"));
+        muls += after.matches("check mul").count() + after.matches("= mul<").count();
+        saturates += before.matches("shift=saturate").count();
+    }
+    assert!(pows_before > 100, "{pows_before}");
+    assert!(pows_after < pows_before, "{pows_after} of {pows_before}");
+    assert!(
+        stubs > 0 && muls > 0 && saturates > 0,
+        "{stubs} {muls} {saturates}"
+    );
+}

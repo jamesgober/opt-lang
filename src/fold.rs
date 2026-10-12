@@ -20,9 +20,21 @@
 //! An operation whose policy would raise at run time is never folded into a
 //! value: it folds to [`Fold::Error`] or [`Fold::Trap`], and the caller keeps the
 //! raising control flow (a `check`'s error edge, or a `trap`).
+//!
+//! OPS v2 is covered: integer `pow` (exact repeated squaring, `0 ** 0 = 1`,
+//! overflow per policy, a negative exponent is `NegativeExponent` under every
+//! policy), float `pow` through ir-lang's shared [`ls_pow`](ir_lang::ls_pow)
+//! (which lives in `core`, so `no_std` builds fold it too), and
+//! `shift = saturate`.
+//!
+//! [`binary_partial`] extends folding to operations where only some operands
+//! are constant: what the result is (`x ** 0`, `x * 0`), which operand it is
+//! (`x ** 1`, `x + 0`), and which errors remain possible (none for `x ** 3`
+//! under `wrap`; only overflow for `x ** 3` under `error`).
 
 use ir_lang::{
-    BinaryOp, CmpOp, ConvOp, DivZero, FloatToInt, OpError, Overflow, Policy, Shift, Type, UnaryOp,
+    BinaryOp, CmpOp, ConvOp, DivZero, FloatToInt, InstData, OpError, Overflow, Policy, Shift, Type,
+    UnaryOp,
 };
 
 use crate::float;
@@ -198,6 +210,12 @@ fn int_binary(op: BinaryOp, policy: Policy, ty: Type, a: u64, b: u64) -> Fold {
             let n = if y < 0 || y >= i128::from(w) {
                 match policy.shift {
                     Some(Shift::Mask) => (b & u64::from(w - 1)) as u32,
+                    // Every bit is shifted out; an arithmetic right shift of a
+                    // negative value keeps the sign. A negative amount is
+                    // still an error.
+                    Some(Shift::Saturate) if y >= 0 => {
+                        return Fold::Value(if op == BinaryOp::Shr && x < 0 { m } else { 0 });
+                    }
                     _ => return Fold::Error(OpError::ShiftOutOfRange),
                 }
             } else {
@@ -213,8 +231,44 @@ fn int_binary(op: BinaryOp, policy: Policy, ty: Type, a: u64, b: u64) -> Fold {
         }
         BinaryOp::Min => Fold::Value(if x <= y { a } else { b }),
         BinaryOp::Max => Fold::Value(if x >= y { a } else { b }),
+        BinaryOp::Pow => int_pow(ty, policy, x, y, a),
         _ => Fold::Unknown,
     }
+}
+
+/// Integer `pow` (OPS v2): the exact power of `x` (bits `a`) to `e >= 0`, or
+/// the `overflow` policy applied to the wrapped power. A negative exponent is
+/// the `NegativeExponent` error under every policy the IR can express (only
+/// `promote` would give a value), `trap` included.
+fn int_pow(ty: Type, policy: Policy, x: i128, e: i128, a: u64) -> Fold {
+    if e < 0 {
+        return Fold::Error(OpError::NegativeExponent);
+    }
+    // Repeated squaring, twice over: wrapping in u64 gives the low bits of the
+    // exact power (reduction mod 2^width commutes with multiplication), and
+    // checked in i128 gives the exact power, or `None` once it leaves i128 (far
+    // beyond every type). A square is taken only while a higher exponent bit
+    // remains, so an overflowing square is always multiplied in. At most 64
+    // rounds: the exponent has at most 64 bits.
+    let (mut wrapped, mut wbase) = (1u64, a);
+    let (mut power, mut base) = (Some(1i128), Some(x));
+    let mut e = e as u128;
+    loop {
+        if e & 1 == 1 {
+            wrapped = wrapped.wrapping_mul(wbase);
+            power = match (power, base) {
+                (Some(r), Some(b)) => r.checked_mul(b),
+                _ => None,
+            };
+        }
+        e >>= 1;
+        if e == 0 {
+            break;
+        }
+        wbase = wbase.wrapping_mul(wbase);
+        base = base.and_then(|b| b.checked_mul(b));
+    }
+    exact(ty, policy, power, wrapped & mask(ty))
 }
 
 /// Folds a binary operation on the bits `a`, `b` of type `ty`. `total_cmp`
@@ -243,6 +297,8 @@ pub(crate) fn binary(op: BinaryOp, policy: Policy, ty: Type, a: u64, b: u64) -> 
             BinaryOp::IeeeRem => float::ieee_remainder(f64::from(x), f64::from(y)) as f32,
             BinaryOp::Min => float::fmin(f64::from(x), f64::from(y)) as f32,
             BinaryOp::Max => float::fmax(f64::from(x), f64::from(y)) as f32,
+            // OPS v2: widen, compute with the shared routine, round once.
+            BinaryOp::Pow => ir_lang::ls_pow(f64::from(x), f64::from(y)) as f32,
             BinaryOp::TotalCmp => {
                 return Fold::Value(wrap(Type::I8, x.total_cmp(&y) as i128));
             }
@@ -261,6 +317,7 @@ pub(crate) fn binary(op: BinaryOp, policy: Policy, ty: Type, a: u64, b: u64) -> 
             BinaryOp::IeeeRem => float::ieee_remainder(x, y),
             BinaryOp::Min => float::fmin(x, y),
             BinaryOp::Max => float::fmax(x, y),
+            BinaryOp::Pow => ir_lang::ls_pow(x, y),
             BinaryOp::TotalCmp => {
                 return Fold::Value(wrap(Type::I8, x.total_cmp(&y) as i128));
             }
@@ -390,12 +447,30 @@ pub(crate) fn convert(op: ConvOp, policy: Policy, from: Type, to: Type, a: u64) 
     }
 }
 
-/// The error kinds an operation can raise under its policy, as a bit set over
-/// OPS codes (bit `k` for code `k`). Empty when it cannot raise.
-pub(crate) fn error_kinds(data: &ir_lang::InstData) -> u32 {
-    use ir_lang::InstData;
+/// The bit of OPS error `e` in an error-kind set.
+pub(crate) const fn bit(e: OpError) -> u32 {
+    1 << e.code()
+}
+
+/// The error kinds an operation can raise, as a bit set over OPS codes (bit `k`
+/// for code `k`); empty when it cannot raise. `ty` is the type of the first
+/// operand. Non-empty exactly when ir-lang's `can_error` says so (checked in
+/// the tests): an `error` field, `char_from_u32`, and on signed integers `pow`
+/// (a negative exponent) and `saturate` shifts (a negative amount).
+pub(crate) fn error_kinds(data: &InstData, ty: Type) -> u32 {
     let mut set = 0u32;
-    let mut add = |e: OpError| set |= 1 << e.code();
+    let mut add = |e: OpError| set |= bit(e);
+    if let InstData::Binary { op, policy, .. } = data {
+        if ty.is_signed_int() {
+            match op {
+                BinaryOp::Pow => add(OpError::NegativeExponent),
+                BinaryOp::Shl | BinaryOp::Shr if policy.shift == Some(Shift::Saturate) => {
+                    add(OpError::ShiftOutOfRange);
+                }
+                _ => {}
+            }
+        }
+    }
     match data {
         InstData::Unary { policy, .. }
         | InstData::Binary { policy, .. }
@@ -423,6 +498,143 @@ pub(crate) fn error_kinds(data: &ir_lang::InstData) -> u32 {
         _ => {}
     }
     set
+}
+
+/// What is known about an integer binary operation when only some of its
+/// operands are constants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Partial {
+    /// Every execution has this outcome (never [`Fold::Unknown`]).
+    Always(Fold),
+    /// The result is always operand `k`, and the operation never raises or
+    /// traps.
+    Operand(usize),
+    /// Not determined. A `trap` policy may still trap.
+    Open {
+        /// The result whenever the operation succeeds, if that is known.
+        value: Option<u64>,
+        /// The OPS error kinds still possible (a subset of [`error_kinds`]).
+        errors: u32,
+    },
+}
+
+/// Folds a binary operation as far as the known operands allow (`None`: not
+/// a constant). With both known it is [`binary`]. Every rule is exact under
+/// OPS for every policy, and is checked against the interpreter in the tests:
+///
+/// - `x + 0`, `0 + x`, `x - 0`, `x * 1`, `1 * x`, `x / 1`, `x << 0`, `x >> 0`,
+///   and `x ** 1` are the other operand, and never raise or trap;
+/// - `x * 0`, `0 * x`, and `x ** 0` (`0 ** 0` included) are constants;
+/// - a division or remainder by a constant zero, a constant out-of-range shift
+///   under `error`, a negative constant shift under `saturate`, and a negative
+///   constant exponent always raise (or trap, per the policy);
+/// - a `saturate` shift by a constant at least the width is `0` (left, or right
+///   on an unsigned type);
+/// - a division by a constant other than `0` and `-1`, a remainder by a
+///   nonzero constant, and a shift by an in-range constant cannot raise;
+/// - `pow` with a constant non-negative exponent cannot raise
+///   `NegativeExponent`; with base `0`, `1`, or `-1` it cannot overflow, and
+///   `1 ** y` is `1` whenever it succeeds.
+pub(crate) fn binary_partial(
+    op: BinaryOp,
+    policy: Policy,
+    ty: Type,
+    a: Option<u64>,
+    b: Option<u64>,
+) -> Partial {
+    let probe = InstData::Binary {
+        op,
+        policy,
+        args: [ir_lang::Value::from_u32(0); 2],
+    };
+    let errors = error_kinds(&probe, ty);
+    let open = Partial::Open {
+        value: None,
+        errors,
+    };
+    if let (Some(a), Some(b)) = (a, b) {
+        return match binary(op, policy, ty, a, b) {
+            Fold::Unknown => open,
+            f => Partial::Always(f),
+        };
+    }
+    if !ty.is_int() {
+        return open;
+    }
+    let w = i128::from(ty.int_bits().unwrap_or(64));
+    let (x, y) = (a.map(|a| sval(ty, a)), b.map(|b| sval(ty, b)));
+    let safe = Partial::Open {
+        value: None,
+        errors: 0,
+    };
+    let neg_exp = bit(OpError::NegativeExponent);
+    match op {
+        BinaryOp::Add => match (x, y) {
+            (_, Some(0)) => Partial::Operand(0),
+            (Some(0), _) => Partial::Operand(1),
+            _ => open,
+        },
+        BinaryOp::Sub if y == Some(0) => Partial::Operand(0),
+        BinaryOp::Mul => match (x, y) {
+            (_, Some(1)) => Partial::Operand(0),
+            (Some(1), _) => Partial::Operand(1),
+            (_, Some(0)) | (Some(0), _) => Partial::Always(Fold::Value(0)),
+            _ => open,
+        },
+        BinaryOp::Div | BinaryOp::FloorDiv => match y {
+            Some(0) => Partial::Always(div_zero(policy)),
+            Some(1) => Partial::Operand(0),
+            // Only `MIN / -1` overflows.
+            Some(-1) => Partial::Open {
+                value: None,
+                errors: errors & bit(OpError::ArithOverflow),
+            },
+            Some(_) => safe,
+            None => open,
+        },
+        BinaryOp::Rem | BinaryOp::FloorMod => match y {
+            Some(0) => Partial::Always(div_zero(policy)),
+            Some(_) => safe,
+            None => open,
+        },
+        BinaryOp::Shl | BinaryOp::Shr => match y {
+            Some(0) => Partial::Operand(0),
+            Some(n) if (0..w).contains(&n) => safe,
+            Some(n) => match policy.shift {
+                Some(Shift::Mask) => safe,
+                Some(Shift::Saturate) if n >= 0 => {
+                    if op == BinaryOp::Shl || !ty.is_signed_int() {
+                        Partial::Always(Fold::Value(0))
+                    } else {
+                        safe
+                    }
+                }
+                _ => Partial::Always(Fold::Error(OpError::ShiftOutOfRange)),
+            },
+            None => open,
+        },
+        BinaryOp::Pow => match (x, y) {
+            (_, Some(e)) if e < 0 => Partial::Always(Fold::Error(OpError::NegativeExponent)),
+            (_, Some(0)) => Partial::Always(Fold::Value(1)),
+            (_, Some(1)) => Partial::Operand(0),
+            (_, Some(_)) => Partial::Open {
+                value: None,
+                errors: errors & !neg_exp,
+            },
+            // |base| <= 1 never overflows; only the exponent's sign matters.
+            (Some(1), None) if errors & neg_exp == 0 => Partial::Always(Fold::Value(1)),
+            (Some(1), None) => Partial::Open {
+                value: Some(1),
+                errors: errors & neg_exp,
+            },
+            (Some(0 | -1), None) => Partial::Open {
+                value: None,
+                errors: errors & neg_exp,
+            },
+            _ => open,
+        },
+        _ => open,
+    }
 }
 
 #[cfg(test)]
@@ -544,7 +756,7 @@ mod tests {
             &[None]
         };
         let shs: &[Option<Shift>] = if req.shift {
-            &[Some(Shift::Error), Some(Shift::Mask)]
+            &[Some(Shift::Error), Some(Shift::Mask), Some(Shift::Saturate)]
         } else {
             &[None]
         };
@@ -601,6 +813,7 @@ mod tests {
                 BinaryOp::Min,
                 BinaryOp::Max,
                 BinaryOp::TotalCmp,
+                BinaryOp::Pow,
             ] {
                 for &a in &edges {
                     for &b in &edges {
@@ -790,20 +1003,261 @@ mod tests {
             policy: Policy::overflow(Overflow::Error).with_div_zero(DivZero::Error),
             args: [v, v],
         };
-        assert_eq!(error_kinds(&div), (1 << 1) | (1 << 2));
+        assert_eq!(error_kinds(&div, Type::I64), (1 << 1) | (1 << 2));
         let ch = InstData::Convert {
             op: ConvOp::CharFromU32,
             policy: Policy::NONE,
             to: Type::U32,
             arg: v,
         };
-        assert_eq!(error_kinds(&ch), 1 << 5);
+        assert_eq!(error_kinds(&ch, Type::U32), 1 << 5);
         let wrap = InstData::Binary {
             op: BinaryOp::Add,
             policy: Policy::overflow(Overflow::Wrap),
             args: [v, v],
         };
-        assert_eq!(error_kinds(&wrap), 0);
+        assert_eq!(error_kinds(&wrap, Type::I64), 0);
+        let pow = InstData::Binary {
+            op: BinaryOp::Pow,
+            policy: Policy::overflow(Overflow::Trap),
+            args: [v, v],
+        };
+        assert_eq!(error_kinds(&pow, Type::I32), 1 << 6);
+        assert_eq!(error_kinds(&pow, Type::U32), 0);
+        let sat = InstData::Binary {
+            op: BinaryOp::Shr,
+            policy: Policy::shift(Shift::Saturate),
+            args: [v, v],
+        };
+        assert_eq!(error_kinds(&sat, Type::I8), 1 << 3);
+        assert_eq!(error_kinds(&sat, Type::U8), 0);
+    }
+
+    /// `error_kinds` is non-empty exactly when ir-lang's placement rule says the
+    /// operation can raise (so it needs a `check`), for every operation, every
+    /// policy, and every operand type.
+    #[test]
+    fn test_error_kinds_match_can_error() {
+        use ir_lang::{InstData, Value};
+        let v = Value::from_u32(0);
+        let all_types = INT_TYPES
+            .iter()
+            .copied()
+            .chain([Type::F32, Type::F64, Type::Bool]);
+        for ty in all_types {
+            for &op in BinaryOp::ALL {
+                for p in int_policies(op) {
+                    let data = InstData::Binary {
+                        op,
+                        policy: p,
+                        args: [v, v],
+                    };
+                    assert_eq!(
+                        error_kinds(&data, ty) != 0,
+                        op.can_error(p, ty),
+                        "{op:?} {p:?} {ty:?}"
+                    );
+                }
+            }
+            for &op in UnaryOp::ALL {
+                for o in [Overflow::Error, Overflow::Wrap, Overflow::Trap] {
+                    let p = Policy::overflow(o);
+                    let data = InstData::Unary {
+                        op,
+                        policy: p,
+                        arg: v,
+                    };
+                    assert_eq!(error_kinds(&data, ty) != 0, op.can_error(p));
+                }
+            }
+        }
+        for (op, _, to) in conversions() {
+            for p in conv_policies(op) {
+                let data = InstData::Convert {
+                    op,
+                    policy: p,
+                    to,
+                    arg: v,
+                };
+                assert_eq!(
+                    error_kinds(&data, Type::I64) != 0,
+                    op.can_error(p),
+                    "{op:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pow_and_saturate_fold_examples() {
+        let wrap_p = Policy::overflow(Overflow::Wrap);
+        let trap = Policy::overflow(Overflow::Trap);
+        let m1 = wrap(Type::I32, -1);
+        assert_eq!(
+            binary(BinaryOp::Pow, wrap_p, Type::I32, 0, 0),
+            Fold::Value(1)
+        );
+        assert_eq!(
+            binary(BinaryOp::Pow, wrap_p, Type::I32, 3, 4),
+            Fold::Value(81)
+        );
+        assert_eq!(
+            binary(BinaryOp::Pow, trap, Type::I32, 2, m1),
+            Fold::Error(OpError::NegativeExponent)
+        );
+        assert_eq!(
+            binary(BinaryOp::Pow, trap, Type::I32, 2, 31),
+            Fold::Trap(OpError::ArithOverflow)
+        );
+        assert_eq!(
+            binary(BinaryOp::Pow, wrap_p, Type::U8, 2, 9),
+            Fold::Value(0)
+        );
+        let sat = Policy::shift(Shift::Saturate);
+        assert_eq!(
+            binary(BinaryOp::Shr, sat, Type::I8, 0x80, 9),
+            Fold::Value(0xff)
+        );
+        assert_eq!(
+            binary(BinaryOp::Shl, sat, Type::I8, 0x7f, 72),
+            Fold::Value(0)
+        );
+        assert_eq!(
+            binary(BinaryOp::Shl, sat, Type::I8, 1, 0xff),
+            Fold::Error(OpError::ShiftOutOfRange)
+        );
+        let two = 2.0f64.to_bits();
+        assert_eq!(
+            binary(
+                BinaryOp::Pow,
+                Policy::NONE,
+                Type::F64,
+                two,
+                10.0f64.to_bits()
+            ),
+            Fold::Value(1024.0f64.to_bits())
+        );
+        // A NaN result is not folded (OPS lets the target choose the payload).
+        let neg = (-8.0f64).to_bits();
+        assert_eq!(
+            binary(
+                BinaryOp::Pow,
+                Policy::NONE,
+                Type::F64,
+                neg,
+                0.5f64.to_bits()
+            ),
+            Fold::Unknown
+        );
+    }
+
+    /// Checks one partial fold against the interpreter for one hidden value.
+    fn partial_agrees(
+        p: Partial,
+        op: BinaryOp,
+        policy: Policy,
+        ty: Type,
+        a: u64,
+        b: u64,
+    ) -> Result<(), std::string::String> {
+        let theirs = interp::eval_binary(op, policy, ty, a, b);
+        let ok = match p {
+            Partial::Always(f) => agrees(f, theirs) && f != Fold::Unknown,
+            Partial::Operand(k) => theirs == Ok(if k == 0 { a } else { b }),
+            Partial::Open { value, errors } => match theirs {
+                Ok(r) => value.is_none_or(|v| v == r),
+                Err(OpFault::Error(e)) => errors & bit(e) != 0,
+                Err(_) => true,
+            },
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(std::format!(
+                "{op:?} {policy:?} {ty:?} {a:#x} {b:#x}: {p:?} vs {theirs:?}"
+            ))
+        }
+    }
+
+    /// The partial fold is sound on the edge values: with one operand known,
+    /// every value of the other agrees with what the fold claims.
+    #[test]
+    fn test_partial_agrees_with_interpreter_on_edges() {
+        for &ty in &INT_TYPES {
+            let edges = int_edges(ty);
+            for &op in BinaryOp::ALL {
+                if matches!(op, BinaryOp::IeeeRem | BinaryOp::TotalCmp) {
+                    continue;
+                }
+                for p in int_policies(op) {
+                    let none = binary_partial(op, p, ty, None, None);
+                    for &k in &edges {
+                        let left = binary_partial(op, p, ty, Some(k), None);
+                        let right = binary_partial(op, p, ty, None, Some(k));
+                        for &h in &edges {
+                            partial_agrees(left, op, p, ty, k, h).unwrap();
+                            partial_agrees(right, op, p, ty, h, k).unwrap();
+                            partial_agrees(none, op, p, ty, h, k).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The OPS identities the passes rely on.
+    #[test]
+    fn test_partial_identities() {
+        let wrap_p = Policy::overflow(Overflow::Wrap);
+        let err = Policy::overflow(Overflow::Error);
+        let one = Some(1);
+        let pow = |p, ty, a, b| binary_partial(BinaryOp::Pow, p, ty, a, b);
+        assert_eq!(pow(wrap_p, Type::I32, None, one), Partial::Operand(0));
+        assert_eq!(
+            pow(err, Type::I32, None, Some(0)),
+            Partial::Always(Fold::Value(1))
+        );
+        assert_eq!(
+            pow(wrap_p, Type::I32, None, Some(3)),
+            Partial::Open {
+                value: None,
+                errors: 0
+            }
+        );
+        assert_eq!(
+            pow(err, Type::I32, None, Some(3)),
+            Partial::Open {
+                value: None,
+                errors: bit(OpError::ArithOverflow)
+            }
+        );
+        assert_eq!(
+            pow(wrap_p, Type::I32, one, None),
+            Partial::Open {
+                value: Some(1),
+                errors: bit(OpError::NegativeExponent)
+            }
+        );
+        assert_eq!(
+            pow(err, Type::U32, one, None),
+            Partial::Always(Fold::Value(1))
+        );
+        let sat = Policy::shift(Shift::Saturate);
+        assert_eq!(
+            binary_partial(BinaryOp::Shl, sat, Type::I16, None, Some(40)),
+            Partial::Always(Fold::Value(0))
+        );
+        assert_eq!(
+            binary_partial(BinaryOp::Shr, sat, Type::I16, None, Some(40)),
+            Partial::Open {
+                value: None,
+                errors: 0
+            }
+        );
+        assert_eq!(
+            binary_partial(BinaryOp::Shr, sat, Type::I16, None, Some(0xffff)),
+            Partial::Always(Fold::Error(OpError::ShiftOutOfRange))
+        );
     }
 
     fn any_int_type() -> impl Strategy<Value = Type> {
@@ -827,12 +1281,52 @@ mod tests {
         }
 
         #[test]
-        fn prop_float_binary_agrees(a in any::<u64>(), b in any::<u64>(), k in 0usize..9, wide in any::<bool>()) {
+        fn prop_partial_agrees(
+            ty in any_int_type(),
+            known in any::<u64>(),
+            hidden in any::<u64>(),
+            k in 0usize..64,
+            left in any::<bool>(),
+            small in any::<bool>(),
+        ) {
+            // Small known values (-1, 0, 1, 2, 3) hit the identities often.
+            let known = if small { (known % 5).wrapping_sub(1) } else { known } & mask(ty);
+            let hidden = hidden & mask(ty);
+            let ops = BinaryOp::ALL;
+            let op = ops[k % ops.len()];
+            prop_assume!(!matches!(op, BinaryOp::IeeeRem | BinaryOp::TotalCmp));
+            for p in int_policies(op) {
+                let r = if left {
+                    partial_agrees(binary_partial(op, p, ty, Some(known), None), op, p, ty, known, hidden)
+                } else {
+                    partial_agrees(binary_partial(op, p, ty, None, Some(known)), op, p, ty, hidden, known)
+                };
+                prop_assert!(r.is_ok(), "{}", r.err().unwrap_or_default());
+            }
+        }
+
+        /// Integer `pow` agrees with the interpreter on small exponents and on
+        /// bases near the overflow boundary, where random bits rarely land.
+        #[test]
+        fn prop_int_pow_agrees(ty in any_int_type(), base in -300i128..300, e in -3i128..70) {
+            let (a, b) = (wrap(ty, base), wrap(ty, e));
+            for p in int_policies(BinaryOp::Pow) {
+                let ours = binary(BinaryOp::Pow, p, ty, a, b);
+                let theirs = interp::eval_binary(BinaryOp::Pow, p, ty, a, b);
+                prop_assert!(
+                    agrees(ours, theirs) && ours != Fold::Unknown,
+                    "{ty:?} {base} ** {e}: {ours:?} vs {theirs:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn prop_float_binary_agrees(a in any::<u64>(), b in any::<u64>(), k in 0usize..10, wide in any::<bool>()) {
             let ty = if wide { Type::F64 } else { Type::F32 };
             let (a, b) = (a & mask(ty), b & mask(ty));
             let op = [
                 BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div, BinaryOp::Rem,
-                BinaryOp::IeeeRem, BinaryOp::Min, BinaryOp::Max, BinaryOp::TotalCmp,
+                BinaryOp::IeeeRem, BinaryOp::Min, BinaryOp::Max, BinaryOp::TotalCmp, BinaryOp::Pow,
             ][k];
             let ours = binary(op, Policy::NONE, ty, a, b);
             let theirs = interp::eval_binary(op, Policy::NONE, ty, a, b);

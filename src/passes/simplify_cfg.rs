@@ -23,13 +23,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use ir_lang::{
-    Block, BlockArg, BlockCall, BuildError, Builder, Function, InstData, Terminator, Value,
-    ValueDef,
+    Block, BlockArg, BlockCall, BuildError, Builder, Function, InstData, Position, Terminator,
+    Value, ValueDef,
 };
 
 use crate::Budget;
 use crate::analysis::{Cfg, NONE, edge_mut, is_unwind_edge};
-use crate::edit::{move_to_end, replace_terminator, rewrite_terminator, use_counts};
+use crate::edit::{replace_terminator, rewrite_terminator, use_counts};
 
 /// The most rounds one run performs.
 pub(crate) const MAX_ROUNDS: usize = 8;
@@ -353,7 +353,7 @@ fn merge_blocks(b: &mut Builder<'_>) -> Result<bool, BuildError> {
             }
             let _ = b.remove_terminator(block)?;
             for inst in insts {
-                let _ = move_to_end(b, inst, block)?;
+                b.move_inst(inst, Position::End(block))?;
             }
             if let Some(term) = b.remove_terminator(next)? {
                 b.switch_to(block)?;

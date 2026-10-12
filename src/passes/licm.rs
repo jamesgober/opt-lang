@@ -22,13 +22,13 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use ir_lang::{Block, BlockCall, BuildError, Builder, ConvOp, Function, InstData, Value};
+use ir_lang::{Block, BlockCall, BuildError, Builder, ConvOp, Function, InstData, Position, Value};
 
 use crate::Budget;
 use crate::analysis::{
     Cfg, DomTree, NONE, def_block, edge_mut, is_tracked, is_unwind_edge, tracked_values,
 };
-use crate::edit::{move_to_end, rewrite_terminator};
+use crate::edit::rewrite_terminator;
 
 struct Loop {
     header: u32,
@@ -323,7 +323,7 @@ pub(crate) fn run(b: &mut Builder<'_>, budget: &mut Budget) -> Result<bool, Buil
             continue;
         };
         for inst in cands {
-            let _ = move_to_end(b, inst, ph)?;
+            b.move_inst(inst, Position::End(ph))?;
         }
         changed = true;
     }

@@ -100,3 +100,60 @@ pub fn mixed(insts: usize) -> (Module, FuncId) {
     b.ret(&[acc]).unwrap();
     (m, f)
 }
+
+/// A chain of `blocks` blocks that each pass `width` values on, of which only
+/// the first is ever used: dead-code elimination removes `(width - 1)`
+/// parameters per block (the bulk parameter-removal path).
+pub fn dead_params(blocks: usize, width: usize) -> (Module, FuncId) {
+    let mut m = Module::new("bench");
+    let f = m
+        .declare_function(
+            "f",
+            &Signature::new(&[Type::I64], &[Type::I64]),
+            Linkage::Export,
+        )
+        .unwrap();
+    let mut b = m.build(f).unwrap();
+    let x = b.param(0).unwrap();
+    let mut vals = vec![x; width];
+    for _ in 0..blocks {
+        let next = b.create_block(&vec![Type::I64; width]).unwrap();
+        b.jump(next, &vals).unwrap();
+        b.switch_to(next).unwrap();
+        vals = b.func().block_params(next).to_vec();
+        let one = b.iconst(Type::I64, 1).unwrap();
+        vals[0] = b.add(vals[0], one, Overflow::Wrap).unwrap();
+    }
+    b.ret(&[vals[0]]).unwrap();
+    (m, f)
+}
+
+/// A chain of `blocks` blocks of `per_block` instructions each, joined by
+/// jumps: CFG simplification merges it into one block, moving every
+/// instruction once (the instruction-move path).
+pub fn chain(blocks: usize, per_block: usize) -> (Module, FuncId) {
+    let mut m = Module::new("bench");
+    let f = m
+        .declare_function(
+            "f",
+            &Signature::new(&[Type::I64], &[Type::I64]),
+            Linkage::Export,
+        )
+        .unwrap();
+    let mut b = m.build(f).unwrap();
+    let mut x = b.param(0).unwrap();
+    for k in 0..blocks {
+        let next = b.create_block(&[Type::I64]).unwrap();
+        for j in 0..per_block {
+            let c = b.iconst(Type::I64, ((k + j) % 251) as i128).unwrap();
+            x = b
+                .binary(ir_lang::BinaryOp::Xor, ir_lang::Policy::NONE, x, c)
+                .unwrap();
+        }
+        b.jump(next, &[x]).unwrap();
+        b.switch_to(next).unwrap();
+        x = b.block_param(next, 0).unwrap();
+    }
+    b.ret(&[x]).unwrap();
+    (m, f)
+}
