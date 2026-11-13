@@ -3,7 +3,7 @@
 > Complete reference for every public item in `opt-lang`, with examples.
 > **Status: pre-1.0 (0.3.0).** The surface is designed across the 0.x series
 > and frozen at `1.0.0`, once a backend consumes optimized IR in production
-> (LexerSketch decision D18). See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> (decision D18). See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
