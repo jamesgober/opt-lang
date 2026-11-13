@@ -19,7 +19,7 @@ readme = "README.md"
 description = "SSA optimization passes for ir-lang: sparse conditional constant propagation, value numbering, dead-code elimination, CFG simplification, copy propagation, and loop-invariant code motion."
 
 # Keywords (5 max)
-keywords = ["optimizer", "ssa", "compiler", "ir", "lexersketch"]
+keywords = ["optimizer", "ssa", "compiler", "ir"]
 
 # Categories
 categories = ["compilers", "no-std"]
